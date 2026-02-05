@@ -22,14 +22,16 @@ pub fn run() -> eframe::Result<()> {
   dotenvy::dotenv().ok();
   let config = read_config(&current_dir_config_path());
 
-  let mut viewport = egui::ViewportBuilder::default()
-    .with_title("Faux")
-    .with_inner_size([320.0, 24.0])
-    .with_resizable(false)
-    .with_decorations(false)
-    .with_transparent(true)
-    .with_taskbar(false)
-    .with_always_on_top();
+    let mut viewport = egui::ViewportBuilder::default()
+      .with_title("Faux")
+      .with_inner_size([320.0, 24.0])
+      .with_resizable(false)
+      .with_decorations(false)
+      .with_transparent(true)
+      .with_taskbar(false);
+    if config.always_on_top {
+      viewport = viewport.with_always_on_top();
+    }
   if let Some(pos) = config.main_position {
     viewport = viewport.with_position([pos.x, pos.y]);
   }
@@ -82,6 +84,9 @@ struct AppState {
     last_position_write: std::time::Instant,
     quit_requested: bool,
     markdown_cache: CommonMarkCache,
+    background_picker_open: bool,
+    text_picker_open: bool,
+    divider_picker_open: bool,
   }
 
   impl AppState {
@@ -107,8 +112,20 @@ struct AppState {
       egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), base.a())
     }
 
+    fn color_swatch(ui: &mut egui::Ui, color: egui::Color32) -> egui::Response {
+      let size = egui::vec2(28.0, 16.0);
+      let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+      let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(80));
+      ui.painter().rect(rect, egui::Rounding::same(3.0), color, stroke);
+      response
+    }
+
     fn border_color(&self) -> egui::Color32 {
       Self::darken(self.background_color(), 0.6)
+    }
+
+    fn divider_color(&self) -> egui::Color32 {
+      self.config.divider_color.to_color32()
     }
 
     fn button_fill(&self, hovered: bool) -> egui::Color32 {
@@ -300,6 +317,9 @@ struct AppState {
         last_position_write: std::time::Instant::now(),
         quit_requested: false,
         markdown_cache: CommonMarkCache::default(),
+        background_picker_open: false,
+        text_picker_open: false,
+        divider_picker_open: false,
       }
   }
 
@@ -454,20 +474,22 @@ struct AppState {
   }
 
 
-  fn main_text(text: impl Into<String>) -> egui::WidgetText {
+  fn main_text(&self, text: impl Into<String>) -> egui::WidgetText {
     egui::WidgetText::from(
       egui::RichText::new(text.into())
         .strong()
-        .extra_letter_spacing(Self::MAIN_LETTER_SPACING),
+        .extra_letter_spacing(Self::MAIN_LETTER_SPACING)
+        .color(self.text_color()),
     )
   }
 
-  fn main_icon(icon: &str, size: f32) -> egui::WidgetText {
+  fn main_icon(&self, icon: &str, size: f32) -> egui::WidgetText {
     egui::WidgetText::from(
       egui::RichText::new(icon)
         .size(size)
         .strong()
-        .extra_letter_spacing(Self::MAIN_LETTER_SPACING),
+        .extra_letter_spacing(Self::MAIN_LETTER_SPACING)
+        .color(self.text_color()),
     )
   }
 
@@ -502,8 +524,8 @@ struct AppState {
     response
   }
 
-  fn text_badge(ui: &mut egui::Ui, text: &str, padding: f32, clickable: bool) -> egui::Response {
-    let text = Self::main_text(text);
+  fn text_badge(&self, ui: &mut egui::Ui, text: &str, padding: f32, clickable: bool) -> egui::Response {
+    let text = self.main_text(text);
     let galley = text.into_galley(ui, Some(false), f32::INFINITY, egui::TextStyle::Body);
     let total = galley.size() + egui::vec2(padding * 2.0, padding * 2.0);
     let sense = if clickable {
@@ -512,7 +534,7 @@ struct AppState {
       egui::Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(total, sense);
-    Self::paint_badge(ui, rect, response.hovered(), true);
+    self.paint_badge(ui, rect, response.hovered(), true);
     let pos = rect.min + (rect.size() - galley.size()) * 0.5;
     ui.painter().galley(pos, galley, ui.visuals().text_color());
     response
@@ -532,7 +554,7 @@ struct AppState {
   fn modifiers_row(&self, ui: &mut egui::Ui, size: f32) {
     self.icon_badge(ui, phosphor::regular::CONTROL, size, 2.0, 3.0, false, true);
     ui.add_space(-4.0);
-    Self::main_label(ui, Self::main_text("/"));
+    Self::main_label(ui, self.main_text("/"));
     ui.add_space(-3.0);
     self.icon_badge(ui, phosphor::regular::COMMAND, size, 2.0, 0.0, false, true);
     ui.add_space(-3.0);
@@ -554,6 +576,11 @@ struct AppState {
       );
     }
     let margin = egui::Margin::symmetric(10.0, 4.0);
+    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.config.always_on_top {
+      egui::WindowLevel::AlwaysOnTop
+    } else {
+      egui::WindowLevel::Normal
+    }));
     let frame = egui::Frame::none()
       .fill(self.background_color())
       .stroke(egui::Stroke::new(1.0, self.border_color()))
@@ -578,22 +605,22 @@ struct AppState {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
             let icon_size = 14.0;
             self.modifiers_row(ui, icon_size);
-            Self::main_label(ui, Self::main_text("+"));
+            Self::main_label(ui, self.main_text("+"));
             ui.add_space(-1.0);
-            Self::text_badge(ui, "H", -2.0, false);
-            Self::main_label(ui, Self::main_icon(phosphor::regular::EYE_SLASH, icon_size));
+            self.text_badge(ui, "H", -2.0, false);
+            Self::main_label(ui, self.main_icon(phosphor::regular::EYE_SLASH, icon_size));
             ui.add_space(-1.0);
-            Self::main_label(ui, Self::main_text("Show/Hide"));
-            draw_vertical_divider(ui, 1.5, self.border_color());
+            Self::main_label(ui, self.main_text("Show/Hide"));
+            draw_vertical_divider(ui, 1.5, self.divider_color(), 2.0);
             self.modifiers_row(ui, icon_size);
-            Self::main_label(ui, Self::main_text("+"));
+            Self::main_label(ui, self.main_text("+"));
             ui.add_space(-1.0);
-            Self::text_badge(ui, "Q", -2.0, false);
-            Self::main_label(ui, Self::main_icon(phosphor::regular::CAMERA, icon_size));
-            Self::main_label(ui, Self::main_text("Take screenshot"));
+            self.text_badge(ui, "Q", -2.0, false);
+            Self::main_label(ui, self.main_icon(phosphor::regular::CAMERA, icon_size));
+            Self::main_label(ui, self.main_text("Take screenshot"));
 
             ui.add_space(1.0);
-            draw_vertical_divider(ui, 1.5, self.border_color());
+            draw_vertical_divider(ui, 1.5, self.divider_color(), 2.0);
             let settings_resp = self.icon_badge(
               ui,
               phosphor::regular::GEAR,
@@ -613,9 +640,9 @@ struct AppState {
             }
             if self.confirm_quit_open {
               ui.add_space(-2.0);
-              Self::main_label(ui, Self::main_text("Quit?"));
-              let yes = Self::text_badge(ui, "Yes", 2.0, true);
-              let no = Self::text_badge(ui, "No", 2.0, true);
+                Self::main_label(ui, self.main_text("Quit?"));
+              let yes = self.text_badge(ui, "Yes", 2.0, true);
+              let no = self.text_badge(ui, "No", 2.0, true);
               if yes.clicked() {
                 self.quit_requested = true;
                 self.confirm_quit_open = false;
@@ -657,22 +684,33 @@ struct AppState {
 
     let viewport = egui::ViewportBuilder::default()
       .with_title("Settings")
-      .with_inner_size([260.0, 140.0])
-      .with_resizable(false)
-      .with_transparent(true)
-      .with_taskbar(false)
-      .with_always_on_top();
+      .with_inner_size([300.0, 365.0])
+        .with_resizable(false)
+        .with_transparent(true)
+        .with_taskbar(false);
+      let viewport = if self.config.always_on_top {
+        viewport.with_always_on_top()
+      } else {
+        viewport
+      };
 
     ctx.show_viewport_immediate(
       egui::ViewportId::from_hash_of("settings"),
       viewport,
-      |ctx, _class| {
-        if ctx.input(|i| i.viewport().close_requested()) {
-          self.settings_open = false;
-          self.settings_hwnd_hooked = false;
-          ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-          return;
-        }
+        |ctx, _class| {
+          if ctx.input(|i| i.viewport().close_requested()) {
+            self.settings_open = false;
+            self.settings_hwnd_hooked = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+          }
+          ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            if self.config.always_on_top {
+              egui::WindowLevel::AlwaysOnTop
+            } else {
+              egui::WindowLevel::Normal
+            },
+          ));
 
           #[cfg(target_os = "windows")]
           {
@@ -694,64 +732,180 @@ struct AppState {
             }
           }
 
-        let frame = egui::Frame::none()
-          .fill(self.background_color())
-          .stroke(egui::Stroke::new(1.0, self.border_color()))
-          .rounding(egui::Rounding::same(0.0))
-          .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+          let frame = egui::Frame::none()
+            .fill(self.background_color())
+            .stroke(egui::Stroke::new(1.0, self.border_color()))
+            .rounding(egui::Rounding::same(0.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 10.0));
 
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-          ui.visuals_mut().override_text_color = Some(self.text_color());
-          let mut changed = false;
+          egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            ui.visuals_mut().override_text_color = Some(self.text_color());
+            let mut changed = false;
 
-          ui.label("API Key");
-          let response = ui.add(
-            egui::TextEdit::singleline(&mut self.config.api_key)
-              .hint_text("JWT / API token")
-              .password(true)
-              .desired_width(220.0),
-          );
-          changed |= response.changed();
+          let group_frame = egui::Frame::none()
+            .stroke(egui::Stroke::new(1.0, self.button_border()))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(10.0));
 
-          ui.add_space(6.0);
-          ui.label("Opacity");
-          let mut opacity = self.config.opacity;
-          if ui
-            .add(egui::Slider::new(&mut opacity, 0.2..=1.0).show_value(true))
-            .changed()
-          {
-            self.config.opacity = opacity;
-            changed = true;
-          }
+          let group_width = (ui.available_width() - 20.0).max(0.0);
+          group_frame.show(ui, |ui| {
+            ui.set_min_width(group_width);
+            ui.label(egui::RichText::new("API Key").strong());
+            ui.add_space(6.0);
+            let response = ui.add(
+              egui::TextEdit::singleline(&mut self.config.api_key)
+                .hint_text("JWT / API token")
+                .password(true)
+                .desired_width(220.0),
+            );
+            changed |= response.changed();
+          });
 
-          ui.add_space(6.0);
-          changed |= ui
-            .checkbox(&mut self.config.stealth, "Stealth (exclude from capture)")
-            .changed();
+          ui.add_space(10.0);
 
-          ui.add_space(6.0);
-          ui.label("Background");
-          let mut bg_color = self.config.background.to_color32();
-          if ui.color_edit_button_srgba(&mut bg_color).changed() {
-            self.config.background = ColorConfig::from_color32(bg_color);
-            changed = true;
-          }
+          let group_width = (ui.available_width() - 20.0).max(0.0);
+          group_frame.show(ui, |ui| {
+            ui.set_min_width(group_width);
+            ui.label(egui::RichText::new("Visibility").strong());
+            ui.add_space(6.0);
+            let mut opacity = self.config.opacity;
+            if ui
+              .add(egui::Slider::new(&mut opacity, 0.2..=1.0).show_value(true))
+              .changed()
+            {
+              self.config.opacity = opacity;
+              changed = true;
+            }
+            ui.add_space(6.0);
+            changed |= ui
+              .checkbox(&mut self.config.stealth, "Stealth (exclude from capture)")
+              .changed();
+            changed |= ui
+              .checkbox(&mut self.config.always_on_top, "Always on top")
+              .changed();
+          });
 
-          ui.add_space(6.0);
-          ui.label("Text");
-          let mut text_color = self.config.text_color.to_color32();
-          if ui.color_edit_button_srgba(&mut text_color).changed() {
-            self.config.text_color = ColorConfig::from_color32(text_color);
-            changed = true;
-          }
+          ui.add_space(10.0);
 
-          ui.add_space(6.0);
-          changed |= ui.checkbox(&mut self.config.test, "test").changed();
+          let group_width = (ui.available_width() - 20.0).max(0.0);
+          group_frame.show(ui, |ui| {
+            ui.set_min_width(group_width);
+            ui.label(egui::RichText::new("Colors").strong());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+              ui.label("Background");
+              if Self::color_swatch(ui, self.config.background.to_color32()).clicked() {
+                self.background_picker_open = !self.background_picker_open;
+                if self.background_picker_open {
+                  self.text_picker_open = false;
+                  self.divider_picker_open = false;
+                }
+              }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+              ui.label("Text");
+              if Self::color_swatch(ui, self.config.text_color.to_color32()).clicked() {
+                self.text_picker_open = !self.text_picker_open;
+                if self.text_picker_open {
+                  self.background_picker_open = false;
+                  self.divider_picker_open = false;
+                }
+              }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+              ui.label("Divider");
+              if Self::color_swatch(ui, self.config.divider_color.to_color32()).clicked() {
+                self.divider_picker_open = !self.divider_picker_open;
+                if self.divider_picker_open {
+                  self.background_picker_open = false;
+                  self.text_picker_open = false;
+                }
+              }
+            });
+          });
+
+          ui.add_space(10.0);
+          ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+              if ui.button("Close").clicked() {
+                self.settings_open = false;
+                self.settings_hwnd_hooked = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+              }
+            });
+          });
 
           if changed {
             self.save_config();
           }
         });
+
+        if self.background_picker_open {
+          egui::Window::new("Background Color")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+              let mut color = self.config.background.to_color32();
+              let changed_picker = egui::color_picker::color_picker_color32(
+                ui,
+                &mut color,
+                egui::color_picker::Alpha::OnlyBlend,
+              );
+              if changed_picker {
+                self.config.background = ColorConfig::from_color32(color);
+                self.save_config();
+              }
+              if ui.button("Close").clicked() {
+                self.background_picker_open = false;
+              }
+            });
+        }
+
+        if self.text_picker_open {
+          egui::Window::new("Text Color")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+              let mut color = self.config.text_color.to_color32();
+              let changed_picker = egui::color_picker::color_picker_color32(
+                ui,
+                &mut color,
+                egui::color_picker::Alpha::OnlyBlend,
+              );
+              if changed_picker {
+                self.config.text_color = ColorConfig::from_color32(color);
+                self.save_config();
+              }
+              if ui.button("Close").clicked() {
+                self.text_picker_open = false;
+              }
+            });
+        }
+
+        if self.divider_picker_open {
+          egui::Window::new("Divider Color")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+              let mut color = self.config.divider_color.to_color32();
+              let changed_picker = egui::color_picker::color_picker_color32(
+                ui,
+                &mut color,
+                egui::color_picker::Alpha::OnlyBlend,
+              );
+              if changed_picker {
+                self.config.divider_color = ColorConfig::from_color32(color);
+                self.save_config();
+              }
+              if ui.button("Close").clicked() {
+                self.divider_picker_open = false;
+              }
+            });
+        }
       },
     );
   }

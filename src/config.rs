@@ -12,8 +12,10 @@ pub struct AppConfig {
   pub api_key: String,
   pub opacity: f32,
   pub stealth: bool,
+  pub always_on_top: bool,
   pub background: ColorConfig,
   pub text_color: ColorConfig,
+  pub divider_color: ColorConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -49,6 +51,7 @@ impl Default for AppConfig {
       api_key: String::new(),
       opacity: 0.6,
       stealth: true,
+      always_on_top: true,
       background: ColorConfig {
         r: 0x33,
         g: 0x33,
@@ -59,6 +62,12 @@ impl Default for AppConfig {
         r: 210,
         g: 210,
         b: 210,
+        a: 0xFF,
+      },
+      divider_color: ColorConfig {
+        r: 90,
+        g: 90,
+        b: 90,
         a: 0xFF,
       },
     }

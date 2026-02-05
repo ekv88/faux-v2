@@ -314,8 +314,12 @@ fn remove_leading_indentation(code: &str) -> String {
       .with_decorations(false)
       .with_transparent(true)
       .with_taskbar(false)
-      .with_mouse_passthrough(true)
-      .with_always_on_top();
+      .with_mouse_passthrough(true);
+    let viewport = if self.config.always_on_top {
+      viewport.with_always_on_top()
+    } else {
+      viewport
+    };
 
     ctx.show_viewport_immediate(
       egui::ViewportId::from_hash_of("response"),
@@ -338,6 +342,11 @@ fn remove_leading_indentation(code: &str) -> String {
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.config.always_on_top {
+          egui::WindowLevel::AlwaysOnTop
+        } else {
+          egui::WindowLevel::Normal
+        }));
         if width_changed {
           ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             desired_width,
@@ -424,17 +433,22 @@ fn remove_leading_indentation(code: &str) -> String {
               }
 
               if let Some(response) = &self.response {
+                let response_text = response.text.clone();
+                let response_code = response.code.clone();
+                let text_color = self.text_color();
+                let divider_color = self.border_color();
                 let left_width = ui.available_width() * 0.48;
                 ui.horizontal(|ui| {
                   ui.allocate_ui_with_layout(
                     egui::vec2(left_width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
+                      ui.visuals_mut().override_text_color = Some(text_color);
                       CommonMarkViewer::new("response_markdown")
-                        .show(ui, &mut self.markdown_cache, &response.text);
+                        .show(ui, &mut self.markdown_cache, &response_text);
                     },
                   );
-                  draw_vertical_divider(ui, ui.available_height(), self.border_color());
+                  draw_vertical_divider(ui, ui.available_height(), divider_color, 2.0);
                   ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
@@ -442,7 +456,7 @@ fn remove_leading_indentation(code: &str) -> String {
                       let code = if Self::FORCE_SAMPLE_CODE {
                         Self::SAMPLE_CODE
                       } else {
-                        let code = response.code.trim();
+                        let code = response_code.trim();
                         let placeholder = code.is_empty()
                           || code.eq_ignore_ascii_case("rs")
                           || code.eq_ignore_ascii_case("rust");

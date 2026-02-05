@@ -1,0 +1,32 @@
+[package]
+name = "faux_v2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = "0.5"
+dotenvy = "0.15"
+eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts"] }
+egui_extras = { version = "0.27", features = ["syntect"] }
+egui-phosphor = { version = "0.5", features = ["regular"] }
+egui_commonmark = "0.16"
+global-hotkey = "0.6"
+raw-window-handle = "0.6"
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
+screenshots = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+[workspace]
+members = [".", "server", "server/migration"]

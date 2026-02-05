@@ -1,0 +1,18 @@
+[package]
+name = "faux_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["multipart"] }
+base64 = "0.22"
+dotenvy = "0.15"
+migration = { path = "migration" }
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
+sea-orm = { version = "1.1.19", features = ["runtime-tokio-rustls", "sqlx-mysql"] }
+sea-orm-migration = { version = "1.1.19", features = ["runtime-tokio-rustls", "sqlx-mysql"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }

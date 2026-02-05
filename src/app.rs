@@ -1,0 +1,785 @@
+use std::sync::{
+  Arc,
+  atomic::{AtomicBool, Ordering},
+  mpsc,
+};
+
+use eframe::egui;
+use egui_commonmark::CommonMarkCache;
+use egui_phosphor as phosphor;
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+
+use crate::api::{ApiResponse, WorkerResult, capture_and_upload};
+use crate::config::{
+  AppConfig, ColorConfig, WindowPosition, current_dir_config_path, read_config, write_config,
+};
+use crate::ui::{draw_vertical_divider, install_phosphor_fonts};
+
+mod response_window;
+
+pub fn run() -> eframe::Result<()> {
+  dotenvy::dotenv().ok();
+  let config = read_config(&current_dir_config_path());
+
+  let mut viewport = egui::ViewportBuilder::default()
+    .with_title("Faux")
+    .with_inner_size([320.0, 24.0])
+    .with_resizable(false)
+    .with_decorations(false)
+    .with_transparent(true)
+    .with_taskbar(false)
+    .with_always_on_top();
+  if let Some(pos) = config.main_position {
+    viewport = viewport.with_position([pos.x, pos.y]);
+  }
+
+  let options = eframe::NativeOptions {
+    renderer: eframe::Renderer::Glow,
+    viewport,
+    ..Default::default()
+  };
+
+  eframe::run_native("Faux", options, Box::new(|cc| Box::new(AppState::new(cc))))
+}
+
+struct HotKeys {
+  show_hide: HotKey,
+  screenshot: HotKey,
+  close_response: HotKey,
+}
+
+struct AppState {
+  config: AppConfig,
+  config_path: std::path::PathBuf,
+  api_url: String,
+
+  hotkeys: HotKeys,
+  _hotkey_manager: GlobalHotKeyManager,
+  hotkey_rx: mpsc::Receiver<GlobalHotKeyEvent>,
+
+  worker_tx: mpsc::Sender<WorkerResult>,
+  worker_rx: mpsc::Receiver<WorkerResult>,
+
+  main_visible: bool,
+  main_visible_atomic: Arc<AtomicBool>,
+  main_size: egui::Vec2,
+  response_open: bool,
+  settings_open: bool,
+  confirm_quit_open: bool,
+  loading: bool,
+  response: Option<ApiResponse>,
+  last_error: Option<String>,
+  response_status: Option<String>,
+  response_size: egui::Vec2,
+  response_hwnd_hooked: bool,
+    response_last_pos: Option<egui::Pos2>,
+    main_hwnd: Option<isize>,
+    main_hwnd_hooked: bool,
+    settings_hwnd_hooked: bool,
+    last_screen_point: Option<(i32, i32)>,
+    last_saved_pos: Option<egui::Pos2>,
+    last_position_write: std::time::Instant,
+    quit_requested: bool,
+    markdown_cache: CommonMarkCache,
+  }
+
+  impl AppState {
+    const MAIN_LETTER_SPACING: f32 = -0.5;
+    const RESPONSE_MAX_HEIGHT: f32 = 620.0;
+  const RESPONSE_MIN_WIDTH: f32 = 460.0;
+  const RESPONSE_MAX_WIDTH: f32 = 860.0;
+  const RESPONSE_HEIGHT: f32 = 400.0;
+  const RESPONSE_ANCHOR_GAP: f32 = 15.0;
+    const RESPONSE_TITLE: &'static str = "Faux Response";
+
+    fn text_color(&self) -> egui::Color32 {
+      self.config.text_color.to_color32()
+    }
+
+    fn background_color(&self) -> egui::Color32 {
+      let base = self.config.background.to_color32();
+      Self::apply_opacity(base, self.config.opacity)
+    }
+
+    fn background_color_layered(&self) -> egui::Color32 {
+      let base = self.config.background.to_color32();
+      egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), base.a())
+    }
+
+    fn border_color(&self) -> egui::Color32 {
+      Self::darken(self.background_color(), 0.6)
+    }
+
+    fn button_fill(&self, hovered: bool) -> egui::Color32 {
+      let base = self.background_color();
+      let factor = if hovered { 0.95 } else { 0.8 };
+      Self::apply_opacity(base, factor)
+    }
+
+    fn button_border(&self) -> egui::Color32 {
+      Self::darken(self.background_color(), 0.7)
+    }
+
+    fn skeleton_color(&self) -> egui::Color32 {
+      let color = self.text_color();
+      egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24)
+    }
+
+    fn apply_opacity(color: egui::Color32, opacity: f32) -> egui::Color32 {
+      let alpha = ((color.a() as f32) * opacity.clamp(0.0, 1.0)).round() as u8;
+      egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    }
+
+    fn darken(color: egui::Color32, factor: f32) -> egui::Color32 {
+      let f = factor.clamp(0.0, 1.0);
+      egui::Color32::from_rgba_unmultiplied(
+        (color.r() as f32 * f) as u8,
+        (color.g() as f32 * f) as u8,
+        (color.b() as f32 * f) as u8,
+        color.a(),
+      )
+    }
+
+  #[cfg(target_os = "windows")]
+  fn apply_windows_tool_window(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+    let mut new_style = ex_style | WS_EX_TOOLWINDOW.0 as i32;
+    new_style &= !(WS_EX_APPWINDOW.0 as i32);
+    if new_style != ex_style {
+      unsafe {
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
+      }
+    }
+  }
+
+  #[cfg(target_os = "windows")]
+  fn apply_windows_exclude_from_capture(hwnd: windows::Win32::Foundation::HWND, enabled: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    };
+    unsafe {
+      let _ = SetWindowDisplayAffinity(
+        hwnd,
+        if enabled { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE },
+      );
+    }
+  }
+
+  fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    let config_path = current_dir_config_path();
+    let config = read_config(&config_path);
+    let api_url =
+      std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3005/ingest".to_string());
+
+    let hotkey_manager = GlobalHotKeyManager::new().expect("global hotkeys must be available");
+    let show_hide = HotKey::new(Some(Modifiers::CONTROL), Code::KeyH);
+    let screenshot = HotKey::new(Some(Modifiers::CONTROL), Code::KeyQ);
+    let close_response = HotKey::new(Some(Modifiers::CONTROL), Code::KeyX);
+    hotkey_manager
+      .register(show_hide)
+      .expect("failed to register show/hide hotkey");
+    hotkey_manager
+      .register(screenshot)
+      .expect("failed to register screenshot hotkey");
+    hotkey_manager
+      .register(close_response)
+      .expect("failed to register close-response hotkey");
+
+    let (worker_tx, worker_rx) = mpsc::channel();
+    let (hotkey_tx, hotkey_rx) = mpsc::channel();
+
+    let main_visible_atomic = Arc::new(AtomicBool::new(true));
+    let show_hide_id = show_hide.id();
+    let repaint_ctx = cc.egui_ctx.clone();
+    let visible_flag = Arc::clone(&main_visible_atomic);
+    #[cfg(target_os = "windows")]
+    let response_title = Self::RESPONSE_TITLE.to_string();
+
+    let main_hwnd = {
+      #[cfg(target_os = "windows")]
+      {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        cc.window_handle()
+          .ok()
+          .and_then(|handle| match handle.as_raw() {
+            RawWindowHandle::Win32(win) => Some(win.hwnd.get()),
+            _ => None,
+          })
+      }
+      #[cfg(not(target_os = "windows"))]
+      {
+        None
+      }
+    };
+    #[cfg(target_os = "windows")]
+    let main_hwnd_for_thread = main_hwnd;
+
+    std::thread::spawn(move || {
+      let hotkey_events = GlobalHotKeyEvent::receiver();
+      while let Ok(event) = hotkey_events.recv() {
+        if event.id == show_hide_id {
+          if event.state != HotKeyState::Pressed {
+            continue;
+          }
+          let new_visible = !visible_flag.load(Ordering::SeqCst);
+          visible_flag.store(new_visible, Ordering::SeqCst);
+
+          #[cfg(target_os = "windows")]
+          {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+              FindWindowW, SW_HIDE, SW_SHOW, ShowWindow,
+            };
+            use windows::core::PCWSTR;
+
+            if let Some(hwnd) = main_hwnd_for_thread {
+              unsafe {
+                ShowWindow(HWND(hwnd), if new_visible { SW_SHOW } else { SW_HIDE });
+              }
+            }
+
+            let title: Vec<u16> = response_title
+              .encode_utf16()
+              .chain(std::iter::once(0))
+              .collect();
+            let response_hwnd = unsafe { FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) };
+            if response_hwnd.0 != 0 {
+              unsafe {
+                ShowWindow(response_hwnd, if new_visible { SW_SHOW } else { SW_HIDE });
+              }
+            }
+          }
+
+          repaint_ctx.request_repaint();
+          continue;
+        }
+
+        let _ = hotkey_tx.send(event);
+        repaint_ctx.request_repaint();
+      }
+    });
+
+    cc.egui_ctx.set_visuals(egui::Visuals::dark());
+    install_phosphor_fonts(&cc.egui_ctx);
+
+    Self {
+      config: config.clone(),
+      config_path,
+      api_url,
+      hotkeys: HotKeys {
+        show_hide,
+        screenshot,
+        close_response,
+      },
+      _hotkey_manager: hotkey_manager,
+      hotkey_rx,
+      worker_tx,
+      worker_rx,
+      main_visible: true,
+      main_visible_atomic,
+      main_size: egui::vec2(320.0, 24.0),
+      response_open: false,
+      settings_open: false,
+      confirm_quit_open: false,
+      loading: false,
+      response: None,
+      last_error: None,
+      response_status: None,
+      response_size: egui::vec2(Self::RESPONSE_MAX_WIDTH, Self::RESPONSE_HEIGHT),
+      response_hwnd_hooked: false,
+      response_last_pos: None,
+      main_hwnd,
+      main_hwnd_hooked: false,
+      settings_hwnd_hooked: false,
+      last_screen_point: None,
+        last_saved_pos: config.main_position.map(|pos| egui::pos2(pos.x, pos.y)),
+        last_position_write: std::time::Instant::now(),
+        quit_requested: false,
+        markdown_cache: CommonMarkCache::default(),
+      }
+  }
+
+  fn process_hotkeys(&mut self, ctx: &egui::Context) {
+    while let Ok(event) = self.hotkey_rx.try_recv() {
+      if event.id == self.hotkeys.show_hide.id() {
+        if event.state != HotKeyState::Pressed {
+          continue;
+        }
+        self.main_visible = !self.main_visible;
+        self
+          .main_visible_atomic
+          .store(self.main_visible, Ordering::SeqCst);
+        self.response_open = self.main_visible && self.response_open;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.main_visible));
+        if self.main_visible {
+          ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+      } else if event.id == self.hotkeys.screenshot.id() {
+        self.start_capture(ctx);
+      } else if event.id == self.hotkeys.close_response.id() {
+        self.close_response();
+      }
+    }
+  }
+
+  fn process_worker_results(&mut self) {
+    while let Ok(result) = self.worker_rx.try_recv() {
+      match result {
+        WorkerResult::Uploading => {
+          self.response_status = Some("Uploading...".to_string());
+          self.loading = true;
+        }
+          WorkerResult::Ok(mut response) => {
+            let trimmed = response.code.trim();
+            if trimmed.eq_ignore_ascii_case("rs")
+              || trimmed.eq_ignore_ascii_case("rust")
+              || trimmed.eq_ignore_ascii_case("code")
+            {
+              response.code.clear();
+            }
+            self.loading = false;
+            self.response = Some(response);
+            self.last_error = None;
+            self.response_status = Some("Ready".to_string());
+          }
+        WorkerResult::Err(err) => {
+          self.loading = false;
+          self.response = None;
+          self.last_error = Some(err);
+          self.response_status = Some("Error".to_string());
+        }
+      }
+    }
+  }
+
+  fn start_capture(&mut self, ctx: &egui::Context) {
+    if self.loading {
+      return;
+    }
+    self.update_last_screen_point(ctx);
+    self.loading = true;
+    self.response_open = true;
+    self.response_hwnd_hooked = false;
+    self.response_last_pos = None;
+    self.response = None;
+    self.last_error = None;
+    self.response_status = Some("Capturing...".to_string());
+
+    let api_url = self.api_url.clone();
+    let auth_token = self
+      .config
+      .api_key
+      .trim()
+      .to_string();
+    let tx = self.worker_tx.clone();
+    let capture_point = self.last_screen_point;
+    std::thread::spawn(move || {
+      let token = if auth_token.is_empty() { None } else { Some(auth_token) };
+      capture_and_upload(&api_url, &tx, capture_point, token);
+    });
+  }
+
+  fn close_response(&mut self) {
+    self.response_open = false;
+    self.loading = false;
+    self.response = None;
+    self.last_error = None;
+    self.response_hwnd_hooked = false;
+    self.response_last_pos = None;
+    self.response_status = None;
+  }
+
+  fn save_config(&self) {
+    let _ = write_config(&self.config_path, &self.config);
+  }
+
+  fn maybe_save_position(&mut self, ctx: &egui::Context) {
+    let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+      return;
+    };
+    let pos = outer.min;
+    let should_write = match self.last_saved_pos {
+      Some(prev) => (pos - prev).length_sq() > 1.0,
+      None => true,
+    };
+    if !should_write {
+      return;
+    }
+    if self.last_position_write.elapsed().as_millis() < 250 {
+      return;
+    }
+
+    self.last_saved_pos = Some(pos);
+    self.last_position_write = std::time::Instant::now();
+    self.config.main_position = Some(WindowPosition { x: pos.x, y: pos.y });
+    self.save_config();
+  }
+
+  fn update_main_size(&mut self, ctx: &egui::Context, desired: egui::Vec2) {
+    let desired = egui::vec2(desired.x.ceil(), desired.y.ceil());
+    if (desired - self.main_size).length_sq() > 0.5 {
+      self.main_size = desired;
+      ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+    }
+  }
+
+  fn sync_visibility(&mut self, ctx: &egui::Context) {
+    let desired = self.main_visible_atomic.load(Ordering::SeqCst);
+    if desired != self.main_visible {
+      self.main_visible = desired;
+      if !self.main_visible {
+        self.response_open = false;
+        self.settings_open = false;
+      }
+      ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.main_visible));
+      if self.main_visible {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+      }
+    }
+  }
+
+  fn update_last_screen_point(&mut self, ctx: &egui::Context) {
+    let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+      return;
+    };
+    let center = outer.center();
+    let scale = ctx.pixels_per_point();
+    let x = (center.x * scale).round() as i32;
+    let y = (center.y * scale).round() as i32;
+    self.last_screen_point = Some((x, y));
+  }
+
+
+  fn main_text(text: impl Into<String>) -> egui::WidgetText {
+    egui::WidgetText::from(
+      egui::RichText::new(text.into())
+        .strong()
+        .extra_letter_spacing(Self::MAIN_LETTER_SPACING),
+    )
+  }
+
+  fn main_icon(icon: &str, size: f32) -> egui::WidgetText {
+    egui::WidgetText::from(
+      egui::RichText::new(icon)
+        .size(size)
+        .strong()
+        .extra_letter_spacing(Self::MAIN_LETTER_SPACING),
+    )
+  }
+
+  fn main_label(ui: &mut egui::Ui, text: egui::WidgetText) {
+    ui.add(egui::Label::new(text).selectable(false));
+  }
+
+  fn icon_badge(
+    &self,
+    ui: &mut egui::Ui,
+    icon: &str,
+    size: f32,
+    padding: f32,
+    y_offset: f32,
+    clickable: bool,
+    border: bool,
+  ) -> egui::Response {
+    let total = size + padding * 2.0;
+    let sense = if clickable {
+      egui::Sense::click()
+    } else {
+      egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(total, total), sense);
+    self.paint_badge(ui, rect, response.hovered(), border);
+
+    let font_id = egui::FontId::new(size, egui::FontFamily::Proportional);
+    let color = self.text_color();
+    let pos = rect.center() + egui::vec2(0.0, y_offset);
+    ui.painter()
+      .text(pos, egui::Align2::CENTER_CENTER, icon, font_id, color);
+    response
+  }
+
+  fn text_badge(ui: &mut egui::Ui, text: &str, padding: f32, clickable: bool) -> egui::Response {
+    let text = Self::main_text(text);
+    let galley = text.into_galley(ui, Some(false), f32::INFINITY, egui::TextStyle::Body);
+    let total = galley.size() + egui::vec2(padding * 2.0, padding * 2.0);
+    let sense = if clickable {
+      egui::Sense::click()
+    } else {
+      egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(total, sense);
+    Self::paint_badge(ui, rect, response.hovered(), true);
+    let pos = rect.min + (rect.size() - galley.size()) * 0.5;
+    ui.painter().galley(pos, galley, ui.visuals().text_color());
+    response
+  }
+
+  fn paint_badge(&self, ui: &mut egui::Ui, rect: egui::Rect, hovered: bool, border: bool) {
+    let rounding = egui::Rounding::same(4.0);
+    let fill = self.button_fill(hovered);
+    let stroke = if border {
+      egui::Stroke::new(1.0, self.button_border())
+    } else {
+      egui::Stroke::NONE
+    };
+    ui.painter().rect(rect, rounding, fill, stroke);
+  }
+
+  fn modifiers_row(&self, ui: &mut egui::Ui, size: f32) {
+    self.icon_badge(ui, phosphor::regular::CONTROL, size, 2.0, 3.0, false, true);
+    ui.add_space(-4.0);
+    Self::main_label(ui, Self::main_text("/"));
+    ui.add_space(-3.0);
+    self.icon_badge(ui, phosphor::regular::COMMAND, size, 2.0, 0.0, false, true);
+    ui.add_space(-3.0);
+  }
+
+  fn show_main_window(&mut self, ctx: &egui::Context) {
+    #[cfg(target_os = "windows")]
+    if !self.main_hwnd_hooked {
+      if let Some(hwnd) = self.main_hwnd {
+        Self::apply_windows_tool_window(windows::Win32::Foundation::HWND(hwnd));
+        self.main_hwnd_hooked = true;
+      }
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = self.main_hwnd {
+      Self::apply_windows_exclude_from_capture(
+        windows::Win32::Foundation::HWND(hwnd),
+        self.config.stealth,
+      );
+    }
+    let margin = egui::Margin::symmetric(10.0, 4.0);
+    let frame = egui::Frame::none()
+      .fill(self.background_color())
+      .stroke(egui::Stroke::new(1.0, self.border_color()))
+      .rounding(egui::Rounding::same(10.0))
+      .inner_margin(margin);
+
+    egui::CentralPanel::default()
+      .frame(egui::Frame::none())
+      .show(ctx, |ui| {
+        ui.visuals_mut().override_text_color = Some(self.text_color());
+        let mut main_row_size = egui::Vec2::ZERO;
+        frame.show(ui, |ui| {
+          let drag = ui.interact(
+            ui.max_rect(),
+            ui.id().with("drag"),
+            egui::Sense::click_and_drag(),
+          );
+          if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+          }
+          let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+            let icon_size = 14.0;
+            self.modifiers_row(ui, icon_size);
+            Self::main_label(ui, Self::main_text("+"));
+            ui.add_space(-1.0);
+            Self::text_badge(ui, "H", -2.0, false);
+            Self::main_label(ui, Self::main_icon(phosphor::regular::EYE_SLASH, icon_size));
+            ui.add_space(-1.0);
+            Self::main_label(ui, Self::main_text("Show/Hide"));
+            draw_vertical_divider(ui, 1.5, self.border_color());
+            self.modifiers_row(ui, icon_size);
+            Self::main_label(ui, Self::main_text("+"));
+            ui.add_space(-1.0);
+            Self::text_badge(ui, "Q", -2.0, false);
+            Self::main_label(ui, Self::main_icon(phosphor::regular::CAMERA, icon_size));
+            Self::main_label(ui, Self::main_text("Take screenshot"));
+
+            ui.add_space(1.0);
+            draw_vertical_divider(ui, 1.5, self.border_color());
+            let settings_resp = self.icon_badge(
+              ui,
+              phosphor::regular::GEAR,
+              icon_size + 2.0,
+              2.0,
+              0.0,
+              true,
+              true,
+            )
+            .on_hover_text("Settings");
+            let clicked = settings_resp.clicked();
+            if clicked {
+              self.settings_open = !self.settings_open;
+              if !self.settings_open {
+                self.settings_hwnd_hooked = false;
+              }
+            }
+            if self.confirm_quit_open {
+              ui.add_space(-2.0);
+              Self::main_label(ui, Self::main_text("Quit?"));
+              let yes = Self::text_badge(ui, "Yes", 2.0, true);
+              let no = Self::text_badge(ui, "No", 2.0, true);
+              if yes.clicked() {
+                self.quit_requested = true;
+                self.confirm_quit_open = false;
+              }
+              if no.clicked() {
+                self.confirm_quit_open = false;
+              }
+            } else {
+              let close_resp = self.icon_badge(
+                ui,
+                phosphor::regular::X,
+                icon_size + 2.0,
+                2.0,
+                0.0,
+                true,
+                true,
+              )
+              .on_hover_text("Quit");
+              if close_resp.clicked() {
+                self.confirm_quit_open = true;
+              }
+            }
+          });
+          main_row_size = row.response.rect.size();
+        });
+
+        let total_width = main_row_size.x + margin.left + margin.right;
+        let total_height = main_row_size.y + margin.top + margin.bottom;
+
+        let desired = egui::vec2(total_width + 2.0, total_height + 2.0);
+        self.update_main_size(ctx, desired);
+      });
+  }
+
+  fn show_settings_window(&mut self, ctx: &egui::Context) {
+    if !self.settings_open {
+      return;
+    }
+
+    let viewport = egui::ViewportBuilder::default()
+      .with_title("Settings")
+      .with_inner_size([260.0, 140.0])
+      .with_resizable(false)
+      .with_transparent(true)
+      .with_taskbar(false)
+      .with_always_on_top();
+
+    ctx.show_viewport_immediate(
+      egui::ViewportId::from_hash_of("settings"),
+      viewport,
+      |ctx, _class| {
+        if ctx.input(|i| i.viewport().close_requested()) {
+          self.settings_open = false;
+          self.settings_hwnd_hooked = false;
+          ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+          return;
+        }
+
+          #[cfg(target_os = "windows")]
+          {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+            let title: Vec<u16> = "Settings"
+              .encode_utf16()
+              .chain(std::iter::once(0))
+              .collect();
+            let hwnd = unsafe { FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) };
+            if hwnd.0 != 0 {
+              if !self.settings_hwnd_hooked {
+                Self::apply_windows_tool_window(HWND(hwnd.0));
+                self.settings_hwnd_hooked = true;
+              }
+              Self::apply_windows_exclude_from_capture(HWND(hwnd.0), self.config.stealth);
+            }
+          }
+
+        let frame = egui::Frame::none()
+          .fill(self.background_color())
+          .stroke(egui::Stroke::new(1.0, self.border_color()))
+          .rounding(egui::Rounding::same(0.0))
+          .inner_margin(egui::Margin::symmetric(12.0, 10.0));
+
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+          ui.visuals_mut().override_text_color = Some(self.text_color());
+          let mut changed = false;
+
+          ui.label("API Key");
+          let response = ui.add(
+            egui::TextEdit::singleline(&mut self.config.api_key)
+              .hint_text("JWT / API token")
+              .password(true)
+              .desired_width(220.0),
+          );
+          changed |= response.changed();
+
+          ui.add_space(6.0);
+          ui.label("Opacity");
+          let mut opacity = self.config.opacity;
+          if ui
+            .add(egui::Slider::new(&mut opacity, 0.2..=1.0).show_value(true))
+            .changed()
+          {
+            self.config.opacity = opacity;
+            changed = true;
+          }
+
+          ui.add_space(6.0);
+          changed |= ui
+            .checkbox(&mut self.config.stealth, "Stealth (exclude from capture)")
+            .changed();
+
+          ui.add_space(6.0);
+          ui.label("Background");
+          let mut bg_color = self.config.background.to_color32();
+          if ui.color_edit_button_srgba(&mut bg_color).changed() {
+            self.config.background = ColorConfig::from_color32(bg_color);
+            changed = true;
+          }
+
+          ui.add_space(6.0);
+          ui.label("Text");
+          let mut text_color = self.config.text_color.to_color32();
+          if ui.color_edit_button_srgba(&mut text_color).changed() {
+            self.config.text_color = ColorConfig::from_color32(text_color);
+            changed = true;
+          }
+
+          ui.add_space(6.0);
+          changed |= ui.checkbox(&mut self.config.test, "test").changed();
+
+          if changed {
+            self.save_config();
+          }
+        });
+      },
+    );
+  }
+}
+
+impl eframe::App for AppState {
+  fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    self.process_hotkeys(ctx);
+    self.process_worker_results();
+    self.sync_visibility(ctx);
+
+    if self.main_visible {
+      self.update_last_screen_point(ctx);
+      self.show_main_window(ctx);
+      self.show_settings_window(ctx);
+      self.show_response_window(ctx);
+      self.maybe_save_position(ctx);
+    }
+
+    if self.quit_requested {
+      ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+      return;
+    }
+
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+  }
+
+  fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+    egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+  }
+}

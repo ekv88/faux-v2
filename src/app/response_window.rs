@@ -231,29 +231,16 @@ impl AppState {
 
               if let Some(response) = &self.response {
                 let response_text = response.text.clone();
-                let response_code = response.code.clone();
                 let text_color = self.text_color();
-                let divider_color = self.border_color();
-                let left_width = ui.available_width() * 0.48;
-                ui.horizontal(|ui| {
-                  ui.allocate_ui_with_layout(
-                    egui::vec2(left_width, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                      ui.visuals_mut().override_text_color = Some(text_color);
-                      CommonMarkViewer::new("response_markdown")
-                        .show(ui, &mut self.markdown_cache, &response_text);
-                    },
-                  );
-                  draw_vertical_divider(ui, ui.available_height(), divider_color, 2.0);
-                  ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), ui.available_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |_ui| {
-                      let _ = &response_code;
-                    },
-                  );
-                });
+                ui.allocate_ui_with_layout(
+                  egui::vec2(ui.available_width(), ui.available_height()),
+                  egui::Layout::top_down(egui::Align::Min),
+                  |ui| {
+                    ui.visuals_mut().override_text_color = Some(text_color);
+                    CommonMarkViewer::new("response_markdown")
+                      .show(ui, &mut self.markdown_cache, &response_text);
+                  },
+                );
               }
             });
             let frame_rect = response.response.rect;

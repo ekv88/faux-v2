@@ -262,6 +262,7 @@ impl AppState {
                 if self.response_scroll_offset > max_offset {
                   self.response_scroll_offset = max_offset;
                 }
+                self.response_scroll_max = max_offset;
               }
             });
             let frame_rect = response.response.rect;

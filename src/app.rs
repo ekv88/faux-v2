@@ -76,6 +76,7 @@ struct AppState {
   response_hwnd_hooked: bool,
   response_last_pos: Option<egui::Pos2>,
   response_scroll_offset: f32,
+  response_scroll_max: f32,
   main_fade: f32,
   main_hwnd: Option<isize>,
     main_hwnd_hooked: bool,
@@ -339,6 +340,7 @@ struct AppState {
       response_hwnd_hooked: false,
       response_last_pos: None,
       response_scroll_offset: 0.0,
+      response_scroll_max: 0.0,
       main_fade: 0.0,
       main_hwnd,
       main_hwnd_hooked: false,
@@ -419,6 +421,8 @@ struct AppState {
     self.last_error = None;
     self.response_status = Some("Capturing...".to_string());
     self.response_scroll_offset = 0.0;
+    self.response_scroll_max = 0.0;
+    self.response_scroll_offset = 0.0;
 
     let api_url = self.api_url.clone();
     let auth_token = self
@@ -443,6 +447,7 @@ struct AppState {
     self.response_last_pos = None;
     self.response_status = None;
     self.response_scroll_offset = 0.0;
+    self.response_scroll_max = 0.0;
   }
 
   fn save_config(&self) {
@@ -734,7 +739,8 @@ impl eframe::App for AppState {
       let delta = ctx.input(|i| i.raw_scroll_delta.y);
       if delta.abs() > 0.0 {
         let next = self.response_scroll_offset - delta;
-        self.response_scroll_offset = next.max(0.0);
+        let max = self.response_scroll_max.max(0.0);
+        self.response_scroll_offset = next.clamp(0.0, max);
       }
     }
 

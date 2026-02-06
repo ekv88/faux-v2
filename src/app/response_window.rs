@@ -1,7 +1,7 @@
 use eframe::egui;
 use egui_commonmark::CommonMarkViewer;
 
-use crate::ui::{draw_vertical_divider, show_skeleton};
+use crate::ui::show_skeleton;
 
 use super::AppState;
 
@@ -97,6 +97,18 @@ impl AppState {
       self.response_size.x = desired_width;
       width_changed = true;
     }
+    let max_height = self.config.response_max_height.max(120.0);
+    let mut height_changed = false;
+    if self.response.is_some() && !self.loading && self.last_error.is_none() {
+      if (self.response_size.y - max_height).abs() > 1.0 {
+        self.response_size.y = max_height;
+        height_changed = true;
+      }
+    }
+    if self.response_size.y > max_height {
+      self.response_size.y = max_height;
+      height_changed = true;
+    }
 
     let viewport = egui::ViewportBuilder::default()
       .with_title(Self::RESPONSE_TITLE)
@@ -139,7 +151,7 @@ impl AppState {
         } else {
           egui::WindowLevel::Normal
         }));
-        if width_changed {
+        if width_changed || height_changed {
           ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             desired_width,
             self.response_size.y,
@@ -232,15 +244,24 @@ impl AppState {
               if let Some(response) = &self.response {
                 let response_text = response.text.clone();
                 let text_color = self.text_color();
-                ui.allocate_ui_with_layout(
-                  egui::vec2(ui.available_width(), ui.available_height()),
-                  egui::Layout::top_down(egui::Align::Min),
-                  |ui| {
-                    ui.visuals_mut().override_text_color = Some(text_color);
-                    CommonMarkViewer::new("response_markdown")
-                      .show(ui, &mut self.markdown_cache, &response_text);
-                  },
-                );
+                let output = egui::ScrollArea::vertical()
+                  .id_source("response_scroll")
+                  .auto_shrink([false, true])
+                  .scroll_offset(egui::vec2(0.0, self.response_scroll_offset))
+                  .show(ui, |ui| {
+                    ui.scope(|ui| {
+                      ui.visuals_mut().override_text_color = None;
+                      ui.visuals_mut().widgets.noninteractive.fg_stroke.color = text_color;
+                      let viewer = CommonMarkViewer::new("response_markdown")
+                        .syntax_theme_dark("base16-ocean.dark")
+                        .syntax_theme_light("base16-ocean.light");
+                      viewer.show(ui, &mut self.markdown_cache, &response_text);
+                    });
+                  });
+                let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                if self.response_scroll_offset > max_offset {
+                  self.response_scroll_offset = max_offset;
+                }
               }
             });
             let frame_rect = response.response.rect;
@@ -250,10 +271,7 @@ impl AppState {
 
         if let Some(size) = content_size {
           let max_height = self.config.response_max_height.max(120.0);
-          let desired_height = size
-            .y
-            .clamp(120.0, max_height)
-            .ceil();
+          let desired_height = size.y.clamp(120.0, max_height).ceil();
           if (self.response_size.y - desired_height).abs() > 1.0 {
             self.response_size.y = desired_height;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(

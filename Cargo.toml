@@ -9,7 +9,7 @@ dotenvy = "0.15"
 eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts"] }
 egui_extras = { version = "0.27", features = ["syntect"] }
 egui-phosphor = { version = "0.5", features = ["regular"] }
-egui_commonmark = "0.16"
+egui_commonmark = { version = "0.16", features = ["better_syntax_highlighting"] }
 global-hotkey = "0.6"
 raw-window-handle = "0.6"
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }

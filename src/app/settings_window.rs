@@ -72,10 +72,18 @@ impl AppState {
             ui.set_min_width(group_width);
             ui.label(egui::RichText::new("API Key").strong());
             ui.add_space(6.0);
+            let font_size = ui
+              .style()
+              .text_styles
+              .get(&egui::TextStyle::Body)
+              .map(|style| style.size)
+              .unwrap_or(14.0)
+              + 2.0;
             let response = ui.add(
               egui::TextEdit::singleline(&mut self.config.api_key)
                 .hint_text("JWT / API token")
                 .password(true)
+                .font(egui::FontId::proportional(font_size))
                 .desired_width(ui.available_width()),
             );
             changed |= response.changed();

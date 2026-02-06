@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use eframe::egui;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +26,7 @@ pub struct WindowPosition {
   pub y: f32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct ColorConfig {
   pub r: u8,
   pub g: u8,
@@ -42,6 +42,67 @@ impl ColorConfig {
   pub fn from_color32(color: egui::Color32) -> Self {
     let [r, g, b, a] = color.to_array();
     Self { r, g, b, a }
+  }
+}
+
+impl Serialize for ColorConfig {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    let value = format!("{}, {}, {}, {}", self.r, self.g, self.b, self.a);
+    serializer.serialize_str(&value)
+  }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ColorConfigRepr {
+  Str(String),
+  Obj {
+    r: u8,
+    g: u8,
+    b: u8,
+    #[serde(default)]
+    a: Option<u8>,
+  },
+}
+
+impl<'de> Deserialize<'de> for ColorConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let parsed = ColorConfigRepr::deserialize(deserializer)?;
+    match parsed {
+      ColorConfigRepr::Obj { r, g, b, a } => Ok(Self {
+        r,
+        g,
+        b,
+        a: a.unwrap_or(255),
+      }),
+      ColorConfigRepr::Str(value) => {
+        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        let mut nums: Vec<u8> = Vec::with_capacity(parts.len());
+        for part in parts {
+          if part.is_empty() {
+            continue;
+          }
+          if let Ok(num) = part.parse::<u8>() {
+            nums.push(num);
+          } else {
+            return Ok(Self { r: 0, g: 0, b: 0, a: 255 });
+          }
+        }
+        if nums.len() == 3 {
+          return Ok(Self { r: nums[0], g: nums[1], b: nums[2], a: 255 });
+        }
+        if nums.len() >= 4 {
+          return Ok(Self { r: nums[0], g: nums[1], b: nums[2], a: nums[3] });
+        }
+        Ok(Self { r: 0, g: 0, b: 0, a: 255 })
+      }
+    }
   }
 }
 

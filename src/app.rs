@@ -74,8 +74,10 @@ struct AppState {
   response_status: Option<String>,
   response_size: egui::Vec2,
   response_hwnd_hooked: bool,
-    response_last_pos: Option<egui::Pos2>,
-    main_hwnd: Option<isize>,
+  response_last_pos: Option<egui::Pos2>,
+  response_scroll_offset: f32,
+  main_fade: f32,
+  main_hwnd: Option<isize>,
     main_hwnd_hooked: bool,
     settings_hwnd_hooked: bool,
     last_screen_point: Option<(i32, i32)>,
@@ -96,9 +98,25 @@ struct AppState {
   const RESPONSE_ANCHOR_GAP: f32 = 10.0;
     const RESPONSE_TITLE: &'static str = "Faux Response";
 
-    fn text_color(&self) -> egui::Color32 {
-      self.config.text_color.to_color32()
-    }
+  fn text_color(&self) -> egui::Color32 {
+    self.config.text_color.to_color32()
+  }
+
+  fn fade_color(color: egui::Color32, factor: f32) -> egui::Color32 {
+    let factor = factor.clamp(0.0, 1.0);
+    let alpha = (color.a() as f32 * factor).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+  }
+
+  fn background_color_main(&self) -> egui::Color32 {
+    let base = self.config.background.to_color32();
+    let opacity = (self.config.opacity * self.main_fade).clamp(0.0, 1.0);
+    Self::apply_opacity(base, opacity)
+  }
+
+  fn border_color_main(&self) -> egui::Color32 {
+    Self::darken(self.background_color_main(), 0.6)
+  }
 
     fn background_color(&self) -> egui::Color32 {
       let base = self.config.background.to_color32();
@@ -320,6 +338,8 @@ struct AppState {
       response_size: egui::vec2(Self::RESPONSE_MAX_WIDTH, Self::RESPONSE_HEIGHT),
       response_hwnd_hooked: false,
       response_last_pos: None,
+      response_scroll_offset: 0.0,
+      main_fade: 0.0,
       main_hwnd,
       main_hwnd_hooked: false,
       settings_hwnd_hooked: false,
@@ -344,7 +364,6 @@ struct AppState {
         self
           .main_visible_atomic
           .store(self.main_visible, Ordering::SeqCst);
-        self.response_open = self.main_visible && self.response_open;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.main_visible));
         if self.main_visible {
           ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -399,6 +418,7 @@ struct AppState {
     self.response = None;
     self.last_error = None;
     self.response_status = Some("Capturing...".to_string());
+    self.response_scroll_offset = 0.0;
 
     let api_url = self.api_url.clone();
     let auth_token = self
@@ -422,6 +442,7 @@ struct AppState {
     self.response_hwnd_hooked = false;
     self.response_last_pos = None;
     self.response_status = None;
+    self.response_scroll_offset = 0.0;
   }
 
   fn save_config(&self) {
@@ -463,8 +484,10 @@ struct AppState {
     if desired != self.main_visible {
       self.main_visible = desired;
       if !self.main_visible {
-        self.response_open = false;
         self.settings_open = false;
+      }
+      if self.main_visible {
+        self.main_fade = 0.0;
       }
       ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.main_visible));
       if self.main_visible {
@@ -489,8 +512,7 @@ struct AppState {
     egui::WidgetText::from(
       egui::RichText::new(text.into())
         .strong()
-        .extra_letter_spacing(Self::MAIN_LETTER_SPACING)
-        .color(self.text_color()),
+        .extra_letter_spacing(Self::MAIN_LETTER_SPACING),
     )
   }
 
@@ -499,8 +521,7 @@ struct AppState {
       egui::RichText::new(icon)
         .size(size)
         .strong()
-        .extra_letter_spacing(Self::MAIN_LETTER_SPACING)
-        .color(self.text_color()),
+        .extra_letter_spacing(Self::MAIN_LETTER_SPACING),
     )
   }
 
@@ -606,15 +627,16 @@ struct AppState {
       egui::WindowLevel::Normal
     }));
     let frame = egui::Frame::none()
-      .fill(self.background_color())
-      .stroke(egui::Stroke::new(1.0, self.border_color()))
+      .fill(self.background_color_main())
+      .stroke(egui::Stroke::new(1.0, self.border_color_main()))
       .rounding(egui::Rounding::same(5.0))
       .inner_margin(margin);
 
     egui::CentralPanel::default()
       .frame(egui::Frame::none())
       .show(ctx, |ui| {
-        ui.visuals_mut().override_text_color = Some(self.text_color());
+        ui.visuals_mut().override_text_color =
+          Some(Self::fade_color(self.text_color(), self.main_fade));
         let mut main_row_size = egui::Vec2::ZERO;
         frame.show(ui, |ui| {
           let drag = ui.interact(
@@ -708,8 +730,20 @@ impl eframe::App for AppState {
     self.process_hotkeys(ctx);
     self.process_worker_results();
     self.sync_visibility(ctx);
+    if self.response_open {
+      let delta = ctx.input(|i| i.raw_scroll_delta.y);
+      if delta.abs() > 0.0 {
+        let next = self.response_scroll_offset - delta;
+        self.response_scroll_offset = next.max(0.0);
+      }
+    }
 
     if self.main_visible {
+      let dt = ctx.input(|i| i.unstable_dt).clamp(0.0, 0.1);
+      if self.main_fade < 1.0 {
+        self.main_fade = (self.main_fade + dt * 6.0).min(1.0);
+        ctx.request_repaint();
+      }
       self.update_last_screen_point(ctx);
       self.show_main_window(ctx);
       self.show_settings_window(ctx);

@@ -113,8 +113,9 @@ Focus on clear reasoning, concrete steps, and practical fixes."
   let user_prompt = env::var("OPENAI_USER_PROMPT").unwrap_or_else(|_| {
     "You will receive an image (screenshot) of a technical test page or student-style question. \
 Analyze the screenshot and answer the question shown. \
-Use the submit_solution tool call to return language, text (Markdown steps), and code (no fences). \
-The text field MUST be GitHub-flavored Markdown for clarity. \
+Identify the programming language from the prompt/code context and return the solution in that language. \
+Use the submit_solution tool call to return language, text (MDX), and code (no fences). \
+The text field MUST be MDX (Markdown + fenced code blocks) and include language tags for all code snippets. \
 Ignore any irrelevant UI like tabs, taskbars, start menus, docks, or unrelated windows. \
 If the question is code-related, ALWAYS include a concrete code example. \
 Do not include any extra text outside the tool call."

@@ -1,3 +1,4 @@
 /target
-.env
-/server/.env
+*.env*
+server/.env
+data/images/*

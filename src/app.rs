@@ -11,12 +11,11 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::api::{ApiResponse, WorkerResult, capture_and_upload};
-use crate::config::{
-  AppConfig, ColorConfig, WindowPosition, current_dir_config_path, read_config, write_config,
-};
+use crate::config::{AppConfig, WindowPosition, current_dir_config_path, read_config, write_config};
 use crate::ui::{draw_vertical_divider, install_phosphor_fonts};
 
 mod response_window;
+mod settings_window;
 
 pub fn run() -> eframe::Result<()> {
   dotenvy::dotenv().ok();
@@ -91,11 +90,10 @@ struct AppState {
 
   impl AppState {
     const MAIN_LETTER_SPACING: f32 = -0.5;
-    const RESPONSE_MAX_HEIGHT: f32 = 620.0;
-  const RESPONSE_MIN_WIDTH: f32 = 460.0;
+  const RESPONSE_MIN_WIDTH: f32 = 470.0;
   const RESPONSE_MAX_WIDTH: f32 = 860.0;
   const RESPONSE_HEIGHT: f32 = 400.0;
-  const RESPONSE_ANCHOR_GAP: f32 = 15.0;
+  const RESPONSE_ANCHOR_GAP: f32 = 10.0;
     const RESPONSE_TITLE: &'static str = "Faux Response";
 
     fn text_color(&self) -> egui::Color32 {
@@ -171,6 +169,19 @@ struct AppState {
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, new_style);
       }
     }
+  }
+
+  #[cfg(target_os = "windows")]
+  fn find_window_by_title(title: &str) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let title: Vec<u16> = title
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect();
+    let hwnd = unsafe { FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) };
+    if hwnd.0 == 0 { None } else { Some(hwnd) }
   }
 
   #[cfg(target_os = "windows")]
@@ -524,10 +535,17 @@ struct AppState {
     response
   }
 
-  fn text_badge(&self, ui: &mut egui::Ui, text: &str, padding: f32, clickable: bool) -> egui::Response {
+  fn text_badge(
+    &self,
+    ui: &mut egui::Ui,
+    text: &str,
+    padding_x: f32,
+    padding_y: f32,
+    clickable: bool,
+  ) -> egui::Response {
     let text = self.main_text(text);
     let galley = text.into_galley(ui, Some(false), f32::INFINITY, egui::TextStyle::Body);
-    let total = galley.size() + egui::vec2(padding * 2.0, padding * 2.0);
+    let total = galley.size() + egui::vec2(padding_x * 2.0, padding_y * 2.0);
     let sense = if clickable {
       egui::Sense::click()
     } else {
@@ -567,6 +585,12 @@ struct AppState {
         Self::apply_windows_tool_window(windows::Win32::Foundation::HWND(hwnd));
         self.main_hwnd_hooked = true;
       }
+      if !self.main_hwnd_hooked {
+        if let Some(hwnd) = Self::find_window_by_title("Faux") {
+          Self::apply_windows_tool_window(hwnd);
+          self.main_hwnd_hooked = true;
+        }
+      }
     }
     #[cfg(target_os = "windows")]
     if let Some(hwnd) = self.main_hwnd {
@@ -584,7 +608,7 @@ struct AppState {
     let frame = egui::Frame::none()
       .fill(self.background_color())
       .stroke(egui::Stroke::new(1.0, self.border_color()))
-      .rounding(egui::Rounding::same(10.0))
+      .rounding(egui::Rounding::same(5.0))
       .inner_margin(margin);
 
     egui::CentralPanel::default()
@@ -607,7 +631,7 @@ struct AppState {
             self.modifiers_row(ui, icon_size);
             Self::main_label(ui, self.main_text("+"));
             ui.add_space(-1.0);
-            self.text_badge(ui, "H", -2.0, false);
+            self.text_badge(ui, "H", 3.0, 2.0, false);
             Self::main_label(ui, self.main_icon(phosphor::regular::EYE_SLASH, icon_size));
             ui.add_space(-1.0);
             Self::main_label(ui, self.main_text("Show/Hide"));
@@ -615,7 +639,7 @@ struct AppState {
             self.modifiers_row(ui, icon_size);
             Self::main_label(ui, self.main_text("+"));
             ui.add_space(-1.0);
-            self.text_badge(ui, "Q", -2.0, false);
+            self.text_badge(ui, "Q", 3.0, 2.0, false);
             Self::main_label(ui, self.main_icon(phosphor::regular::CAMERA, icon_size));
             Self::main_label(ui, self.main_text("Take screenshot"));
 
@@ -641,8 +665,8 @@ struct AppState {
             if self.confirm_quit_open {
               ui.add_space(-2.0);
                 Self::main_label(ui, self.main_text("Quit?"));
-              let yes = self.text_badge(ui, "Yes", 2.0, true);
-              let no = self.text_badge(ui, "No", 2.0, true);
+              let yes = self.text_badge(ui, "Yes", 3.0, 2.0, true);
+              let no = self.text_badge(ui, "No", 3.0, 2.0, true);
               if yes.clicked() {
                 self.quit_requested = true;
                 self.confirm_quit_open = false;
@@ -677,238 +701,6 @@ struct AppState {
       });
   }
 
-  fn show_settings_window(&mut self, ctx: &egui::Context) {
-    if !self.settings_open {
-      return;
-    }
-
-    let viewport = egui::ViewportBuilder::default()
-      .with_title("Settings")
-      .with_inner_size([300.0, 365.0])
-        .with_resizable(false)
-        .with_transparent(true)
-        .with_taskbar(false);
-      let viewport = if self.config.always_on_top {
-        viewport.with_always_on_top()
-      } else {
-        viewport
-      };
-
-    ctx.show_viewport_immediate(
-      egui::ViewportId::from_hash_of("settings"),
-      viewport,
-        |ctx, _class| {
-          if ctx.input(|i| i.viewport().close_requested()) {
-            self.settings_open = false;
-            self.settings_hwnd_hooked = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-          }
-          ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            if self.config.always_on_top {
-              egui::WindowLevel::AlwaysOnTop
-            } else {
-              egui::WindowLevel::Normal
-            },
-          ));
-
-          #[cfg(target_os = "windows")]
-          {
-            use windows::core::PCWSTR;
-            use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-
-            let title: Vec<u16> = "Settings"
-              .encode_utf16()
-              .chain(std::iter::once(0))
-              .collect();
-            let hwnd = unsafe { FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) };
-            if hwnd.0 != 0 {
-              if !self.settings_hwnd_hooked {
-                Self::apply_windows_tool_window(HWND(hwnd.0));
-                self.settings_hwnd_hooked = true;
-              }
-              Self::apply_windows_exclude_from_capture(HWND(hwnd.0), self.config.stealth);
-            }
-          }
-
-          let frame = egui::Frame::none()
-            .fill(self.background_color())
-            .stroke(egui::Stroke::new(1.0, self.border_color()))
-            .rounding(egui::Rounding::same(0.0))
-            .inner_margin(egui::Margin::symmetric(10.0, 10.0));
-
-          egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            ui.visuals_mut().override_text_color = Some(self.text_color());
-            let mut changed = false;
-
-          let group_frame = egui::Frame::none()
-            .stroke(egui::Stroke::new(1.0, self.button_border()))
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(10.0));
-
-          let group_width = (ui.available_width() - 20.0).max(0.0);
-          group_frame.show(ui, |ui| {
-            ui.set_min_width(group_width);
-            ui.label(egui::RichText::new("API Key").strong());
-            ui.add_space(6.0);
-            let response = ui.add(
-              egui::TextEdit::singleline(&mut self.config.api_key)
-                .hint_text("JWT / API token")
-                .password(true)
-                .desired_width(220.0),
-            );
-            changed |= response.changed();
-          });
-
-          ui.add_space(10.0);
-
-          let group_width = (ui.available_width() - 20.0).max(0.0);
-          group_frame.show(ui, |ui| {
-            ui.set_min_width(group_width);
-            ui.label(egui::RichText::new("Visibility").strong());
-            ui.add_space(6.0);
-            let mut opacity = self.config.opacity;
-            if ui
-              .add(egui::Slider::new(&mut opacity, 0.2..=1.0).show_value(true))
-              .changed()
-            {
-              self.config.opacity = opacity;
-              changed = true;
-            }
-            ui.add_space(6.0);
-            changed |= ui
-              .checkbox(&mut self.config.stealth, "Stealth (exclude from capture)")
-              .changed();
-            changed |= ui
-              .checkbox(&mut self.config.always_on_top, "Always on top")
-              .changed();
-          });
-
-          ui.add_space(10.0);
-
-          let group_width = (ui.available_width() - 20.0).max(0.0);
-          group_frame.show(ui, |ui| {
-            ui.set_min_width(group_width);
-            ui.label(egui::RichText::new("Colors").strong());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-              ui.label("Background");
-              if Self::color_swatch(ui, self.config.background.to_color32()).clicked() {
-                self.background_picker_open = !self.background_picker_open;
-                if self.background_picker_open {
-                  self.text_picker_open = false;
-                  self.divider_picker_open = false;
-                }
-              }
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-              ui.label("Text");
-              if Self::color_swatch(ui, self.config.text_color.to_color32()).clicked() {
-                self.text_picker_open = !self.text_picker_open;
-                if self.text_picker_open {
-                  self.background_picker_open = false;
-                  self.divider_picker_open = false;
-                }
-              }
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-              ui.label("Divider");
-              if Self::color_swatch(ui, self.config.divider_color.to_color32()).clicked() {
-                self.divider_picker_open = !self.divider_picker_open;
-                if self.divider_picker_open {
-                  self.background_picker_open = false;
-                  self.text_picker_open = false;
-                }
-              }
-            });
-          });
-
-          ui.add_space(10.0);
-          ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-              if ui.button("Close").clicked() {
-                self.settings_open = false;
-                self.settings_hwnd_hooked = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-              }
-            });
-          });
-
-          if changed {
-            self.save_config();
-          }
-        });
-
-        if self.background_picker_open {
-          egui::Window::new("Background Color")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-              let mut color = self.config.background.to_color32();
-              let changed_picker = egui::color_picker::color_picker_color32(
-                ui,
-                &mut color,
-                egui::color_picker::Alpha::OnlyBlend,
-              );
-              if changed_picker {
-                self.config.background = ColorConfig::from_color32(color);
-                self.save_config();
-              }
-              if ui.button("Close").clicked() {
-                self.background_picker_open = false;
-              }
-            });
-        }
-
-        if self.text_picker_open {
-          egui::Window::new("Text Color")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-              let mut color = self.config.text_color.to_color32();
-              let changed_picker = egui::color_picker::color_picker_color32(
-                ui,
-                &mut color,
-                egui::color_picker::Alpha::OnlyBlend,
-              );
-              if changed_picker {
-                self.config.text_color = ColorConfig::from_color32(color);
-                self.save_config();
-              }
-              if ui.button("Close").clicked() {
-                self.text_picker_open = false;
-              }
-            });
-        }
-
-        if self.divider_picker_open {
-          egui::Window::new("Divider Color")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-              let mut color = self.config.divider_color.to_color32();
-              let changed_picker = egui::color_picker::color_picker_color32(
-                ui,
-                &mut color,
-                egui::color_picker::Alpha::OnlyBlend,
-              );
-              if changed_picker {
-                self.config.divider_color = ColorConfig::from_color32(color);
-                self.save_config();
-              }
-              if ui.button("Close").clicked() {
-                self.divider_picker_open = false;
-              }
-            });
-        }
-      },
-    );
-  }
 }
 
 impl eframe::App for AppState {

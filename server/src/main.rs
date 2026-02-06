@@ -55,10 +55,12 @@ struct OpenAiResponse {
 }
 
 #[derive(Deserialize)]
-struct OpenAiOutput {
+  struct OpenAiOutput {
   #[serde(rename = "type")]
   r#type: String,
   content: Option<Vec<OpenAiContent>>,
+  name: Option<String>,
+  arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +68,13 @@ struct OpenAiContent {
   #[serde(rename = "type")]
   r#type: String,
   text: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ToolResult {
+  text: String,
+  code: String,
+  language: String,
 }
 
 #[tokio::main]
@@ -93,26 +102,22 @@ async fn main() -> anyhow::Result<()> {
     }
   });
   let openai_api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-  let openai_model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string());
+  let openai_model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string());
   let system_prompt = env::var("OPENAI_SYSTEM_PROMPT").unwrap_or_else(|_| {
     "You are a senior software engineer and technical instructor. \
-You explain solutions like a professor: precise, methodical, and highly detailed. \
-Assume the user is running a technical test and expects a deep, correct answer. \
+You explain solutions like a professor: precise, methodical, and highly detailed, \
+but you can also answer student-style questions clearly and patiently. \
 Focus on clear reasoning, concrete steps, and practical fixes."
       .to_string()
   });
   let user_prompt = env::var("OPENAI_USER_PROMPT").unwrap_or_else(|_| {
-    "Analyze the screenshot and return ONLY valid JSON in this exact shape: \
-{\"text\":\"...\",\"code\":\"...\"}. \
-The \"text\" field MUST be GitHub-flavored Markdown and include a numbered, step-by-step solution, \
-root-cause analysis, and any important caveats. Keep it detailed and thorough. \
-The \"code\" field MUST contain the actual code snippet(s) for the solution (no markdown fences). \
-Do NOT leave it empty if you provided code in the markdown text. \
-If there are multiple snippets, concatenate them separated by a blank line. \
-If you do not have code, return an empty string. \
-Never return language labels or placeholders like \"rs\", \"rust\", \"language\", or \"code\". \
-If no code is needed, return an empty string for \"code\". \
-Do not include any extra text outside the JSON."
+    "You will receive an image (screenshot) of a technical test page or student-style question. \
+Analyze the screenshot and answer the question shown. \
+Use the submit_solution tool call to return language, text (Markdown steps), and code (no fences). \
+The text field MUST be GitHub-flavored Markdown for clarity. \
+Ignore any irrelevant UI like tabs, taskbars, start menus, docks, or unrelated windows. \
+If the question is code-related, ALWAYS include a concrete code example. \
+Do not include any extra text outside the tool call."
       .to_string()
   });
 
@@ -349,7 +354,26 @@ async fn call_openai(
           { "type": "input_image", "image_url": image_url }
         ]
       }
-    ]
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "submit_solution",
+        "description": "Return the final solution for the screenshot as structured data.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "language": { "type": "string" },
+            "text": { "type": "string", "description": "Markdown explanation with step-by-step solution." },
+            "code": { "type": "string", "description": "Code snippet(s) without markdown fences." }
+          },
+          "required": ["language", "text", "code"]
+        },
+        "strict": true
+      }
+    ],
+    "tool_choice": { "type": "function", "name": "submit_solution" }
   });
 
   let response = state
@@ -375,9 +399,18 @@ async fn call_openai(
     .json()
     .await
     .map_err(internal_error("Invalid OpenAI JSON response"))?;
+  if let Some(tool) = extract_tool_call(&api) {
+    let raw = serde_json::to_string(&tool).unwrap_or_default();
+    let mut parsed = IngestResponse {
+      text: tool.text,
+      code: tool.code,
+    };
+    normalize_response(&mut parsed);
+    return Ok((parsed, raw));
+  }
+
   let output_text =
     extract_output_text(&api).ok_or_else(|| bad_gateway("Missing OpenAI output"))?;
-
   let mut parsed = serde_json::from_str::<IngestResponse>(&output_text).map_err(|err| {
     error_response(
       StatusCode::BAD_GATEWAY,
@@ -402,6 +435,23 @@ fn extract_output_text(api: &OpenAiResponse) -> Option<String> {
             return Some(text.clone());
           }
         }
+      }
+    }
+  }
+  None
+}
+
+fn extract_tool_call(api: &OpenAiResponse) -> Option<ToolResult> {
+  for item in &api.output {
+    if item.r#type != "function_call" {
+      continue;
+    }
+    if item.name.as_deref() != Some("submit_solution") {
+      continue;
+    }
+    if let Some(args) = &item.arguments {
+      if let Ok(parsed) = serde_json::from_str::<ToolResult>(args) {
+        return Some(parsed);
       }
     }
   }

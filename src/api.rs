@@ -1,6 +1,6 @@
 use std::fs;
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use reqwest::header::AUTHORIZATION;
@@ -88,7 +88,15 @@ fn capture_and_upload_inner(
     .map_err(|e| e.to_string())?;
   let form = reqwest::blocking::multipart::Form::new().part("file", part);
 
-  let client = reqwest::blocking::Client::new();
+  let timeout_secs = std::env::var("API_TIMEOUT_SECS")
+    .ok()
+    .and_then(|val| val.parse::<u64>().ok())
+    .unwrap_or(180);
+  let client = reqwest::blocking::Client::builder()
+    .timeout(Duration::from_secs(timeout_secs))
+    .connect_timeout(Duration::from_secs(10))
+    .build()
+    .map_err(|e| e.to_string())?;
   let mut request = client.post(api_url).multipart(form);
   if let Some(token) = auth_token {
     let token = token.trim();
@@ -164,7 +172,13 @@ fn map_request_error(api_url: &str, err: reqwest::Error) -> String {
     );
   }
   if err.is_timeout() {
-    return "The request timed out. Please try again.".to_string();
+    let timeout_secs = std::env::var("API_TIMEOUT_SECS")
+      .ok()
+      .and_then(|val| val.parse::<u64>().ok())
+      .unwrap_or(180);
+    return format!(
+      "The request timed out after {timeout_secs}s. Please try again or use a faster model."
+    );
   }
   if err.is_body() || err.is_decode() {
     return "Server response could not be read. Please try again.".to_string();

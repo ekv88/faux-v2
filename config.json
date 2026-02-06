@@ -1,17 +1,17 @@
 {
   "test": true,
   "main_position": {
-    "x": 234.0,
-    "y": 272.0
+    "x": 249.0,
+    "y": 53.0
   },
   "api_key": "jwt-0f2d5b6a-7f8a-4b2e-9b43-0a5a2a9f9b01",
-  "opacity": 0.85,
+  "opacity": 0.89,
   "stealth": true,
   "always_on_top": true,
   "background": {
-    "r": 58,
-    "g": 58,
-    "b": 59,
+    "r": 43,
+    "g": 43,
+    "b": 54,
     "a": 255
   },
   "text_color": {
@@ -21,9 +21,11 @@
     "a": 255
   },
   "divider_color": {
-    "r": 1,
-    "g": 1,
-    "b": 1,
+    "r": 25,
+    "g": 21,
+    "b": 21,
     "a": 152
-  }
+  },
+  "response_max_width": 1380.0,
+  "response_max_height": 1200.0
 }

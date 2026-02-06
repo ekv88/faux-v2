@@ -16,6 +16,8 @@ pub struct AppConfig {
   pub background: ColorConfig,
   pub text_color: ColorConfig,
   pub divider_color: ColorConfig,
+  pub response_max_width: f32,
+  pub response_max_height: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -70,6 +72,8 @@ impl Default for AppConfig {
         b: 90,
         a: 0xFF,
       },
+      response_max_width: 860.0,
+      response_max_height: 620.0,
     }
   }
 }

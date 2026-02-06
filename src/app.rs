@@ -1,8 +1,9 @@
 use std::sync::{
   Arc,
-  atomic::{AtomicBool, Ordering},
+  atomic::{AtomicBool, AtomicU32, Ordering},
   mpsc,
 };
+use std::str::FromStr;
 
 use eframe::egui;
 use egui_commonmark::CommonMarkCache;
@@ -44,10 +45,20 @@ pub fn run() -> eframe::Result<()> {
   eframe::run_native("Faux", options, Box::new(|cc| Box::new(AppState::new(cc))))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HotKeys {
   show_hide: HotKey,
   screenshot: HotKey,
   close_response: HotKey,
+  quit: HotKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HotkeyAction {
+  ShowHide,
+  Screenshot,
+  CloseResponse,
+  Quit,
 }
 
 struct AppState {
@@ -58,6 +69,7 @@ struct AppState {
   hotkeys: HotKeys,
   _hotkey_manager: GlobalHotKeyManager,
   hotkey_rx: mpsc::Receiver<GlobalHotKeyEvent>,
+  show_hide_id: Arc<AtomicU32>,
 
   worker_tx: mpsc::Sender<WorkerResult>,
   worker_rx: mpsc::Receiver<WorkerResult>,
@@ -78,6 +90,10 @@ struct AppState {
   response_scroll_offset: f32,
   response_scroll_max: f32,
   main_fade: f32,
+  main_dragging: bool,
+  hotkey_capture: Option<HotkeyAction>,
+  config_dirty: bool,
+  last_config_save: std::time::Instant,
   main_hwnd: Option<isize>,
     main_hwnd_hooked: bool,
     settings_hwnd_hooked: bool,
@@ -98,6 +114,194 @@ struct AppState {
   const RESPONSE_HEIGHT: f32 = 400.0;
   const RESPONSE_ANCHOR_GAP: f32 = 10.0;
     const RESPONSE_TITLE: &'static str = "Faux Response";
+
+  fn parse_hotkey_spec(spec: &str, fallback: &str) -> HotKey {
+    HotKey::from_str(spec)
+      .or_else(|_| HotKey::from_str(fallback))
+      .unwrap_or_else(|_| HotKey::new(Some(Modifiers::CONTROL), Code::KeyH))
+  }
+
+  fn normalize_hotkey_token(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+      return None;
+    }
+    let upper = trimmed.to_uppercase();
+    if upper == "ESC" || upper == "ESCAPE" {
+      return Some("Escape".to_string());
+    }
+    if upper.starts_with('F')
+      && upper.len() <= 3
+      && upper[1..].chars().all(|c| c.is_ascii_digit())
+    {
+      return Some(upper);
+    }
+    if trimmed.len() == 1 {
+      let ch = trimmed.chars().next().unwrap();
+      if ch.is_ascii_alphabetic() {
+        return Some(format!("Key{}", ch.to_ascii_uppercase()));
+      }
+      if ch.is_ascii_digit() {
+        return Some(format!("Digit{}", ch));
+      }
+    }
+    None
+  }
+
+  fn hotkey_spec_from_token(token: &str, action: HotkeyAction) -> Option<String> {
+    let key = Self::normalize_hotkey_token(token)?;
+    let spec = match action {
+      HotkeyAction::Quit => format!("CmdOrCtrl+{key}"),
+      _ => format!("CmdOrCtrl+{key}"),
+    };
+    Some(spec)
+  }
+
+  fn hotkeys_from_config(config: &AppConfig) -> HotKeys {
+    let show_hide_spec = Self::hotkey_spec_from_token(&config.hotkeys.show_hide, HotkeyAction::ShowHide)
+      .unwrap_or_else(|| "CmdOrCtrl+KeyH".to_string());
+    let screenshot_spec = Self::hotkey_spec_from_token(&config.hotkeys.screenshot, HotkeyAction::Screenshot)
+      .unwrap_or_else(|| "CmdOrCtrl+KeyQ".to_string());
+    let close_spec = Self::hotkey_spec_from_token(&config.hotkeys.close_response, HotkeyAction::CloseResponse)
+      .unwrap_or_else(|| "CmdOrCtrl+KeyX".to_string());
+    let quit_spec = Self::hotkey_spec_from_token(&config.hotkeys.quit, HotkeyAction::Quit)
+      .unwrap_or_else(|| "CmdOrCtrl+Escape".to_string());
+
+    let show_hide = Self::parse_hotkey_spec(&show_hide_spec, "CmdOrCtrl+KeyH");
+    let screenshot = Self::parse_hotkey_spec(&screenshot_spec, "CmdOrCtrl+KeyQ");
+    let close_response = Self::parse_hotkey_spec(&close_spec, "CmdOrCtrl+KeyX");
+    let quit = Self::parse_hotkey_spec(&quit_spec, "CmdOrCtrl+Escape");
+    HotKeys {
+      show_hide,
+      screenshot,
+      close_response,
+      quit,
+    }
+  }
+
+  fn register_hotkeys_with_fallback(
+    manager: &GlobalHotKeyManager,
+    mut hotkeys: HotKeys,
+  ) -> Result<(HotKeys, Option<String>), String> {
+    manager
+      .register(hotkeys.show_hide)
+      .map_err(|e| format!("show/hide hotkey: {e}"))?;
+    manager
+      .register(hotkeys.screenshot)
+      .map_err(|e| format!("screenshot hotkey: {e}"))?;
+    manager
+      .register(hotkeys.close_response)
+      .map_err(|e| format!("close-response hotkey: {e}"))?;
+
+    if manager.register(hotkeys.quit).is_err() {
+      let fallback = Self::parse_hotkey_spec("CmdOrCtrl+KeyP", "CmdOrCtrl+KeyP");
+      if manager.register(fallback).is_ok() {
+        hotkeys.quit = fallback;
+        return Ok((hotkeys, Some("P".to_string())));
+      }
+      let fallback_alt = Self::parse_hotkey_spec("CmdOrCtrl+KeyO", "CmdOrCtrl+KeyO");
+      if manager.register(fallback_alt).is_ok() {
+        hotkeys.quit = fallback_alt;
+        return Ok((hotkeys, Some("O".to_string())));
+      }
+      return Ok((hotkeys, None));
+    }
+
+    Ok((hotkeys, None))
+  }
+
+  fn apply_hotkeys_from_config(&mut self) {
+    let desired_hotkeys = Self::hotkeys_from_config(&self.config);
+    if desired_hotkeys == self.hotkeys {
+      return;
+    }
+
+    let old = self.hotkeys;
+    let _ = self._hotkey_manager.unregister(old.show_hide);
+    let _ = self._hotkey_manager.unregister(old.screenshot);
+    let _ = self._hotkey_manager.unregister(old.close_response);
+    let _ = self._hotkey_manager.unregister(old.quit);
+
+    let (registered, quit_token) =
+      match Self::register_hotkeys_with_fallback(&self._hotkey_manager, desired_hotkeys) {
+        Ok(result) => result,
+        Err(err) => {
+          eprintln!("Failed to register hotkeys: {err}");
+          let _ = Self::register_hotkeys_with_fallback(&self._hotkey_manager, old);
+          return;
+        }
+      };
+
+    if let Some(token) = quit_token {
+      self.config.hotkeys.quit = token;
+      self.save_config();
+    }
+
+    self.hotkeys = registered;
+    self.show_hide_id
+      .store(self.hotkeys.show_hide.id(), Ordering::SeqCst);
+  }
+
+  fn try_register_hotkeys_on_start(
+    config: &mut AppConfig,
+    manager: &GlobalHotKeyManager,
+  ) -> HotKeys {
+    let desired = Self::hotkeys_from_config(config);
+    let (registered, quit_token) =
+      Self::register_hotkeys_with_fallback(manager, desired)
+        .expect("failed to register hotkeys");
+    if let Some(token) = quit_token {
+      config.hotkeys.quit = token;
+    }
+    registered
+  }
+
+  fn hotkey_label_from_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+      return "?".to_string();
+    }
+    let upper = trimmed.to_uppercase();
+    if upper == "ESC" || upper == "ESCAPE" {
+      return "Esc".to_string();
+    }
+    if upper.starts_with('F')
+      && upper.len() <= 3
+      && upper[1..].chars().all(|c| c.is_ascii_digit())
+    {
+      return upper;
+    }
+    if trimmed.len() == 1 {
+      return trimmed.to_ascii_uppercase();
+    }
+    trimmed.to_string()
+  }
+
+  fn update_hotkey_binding(&mut self, action: HotkeyAction, token: String) {
+    eprintln!("Update hotkey {:?} -> {}", action, token);
+    match action {
+      HotkeyAction::ShowHide => self.config.hotkeys.show_hide = token,
+      HotkeyAction::Screenshot => self.config.hotkeys.screenshot = token,
+      HotkeyAction::CloseResponse => self.config.hotkeys.close_response = token,
+      HotkeyAction::Quit => self.config.hotkeys.quit = token,
+    }
+    self.apply_hotkeys_from_config();
+    self.save_config();
+  }
+
+  fn egui_key_to_token(key: egui::Key) -> Option<String> {
+    if key == egui::Key::Escape {
+      return Some("ESC".to_string());
+    }
+    let name = key.name();
+    if name.len() == 1 && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+      return Some(name.to_ascii_uppercase());
+    }
+    if name.starts_with('F') && name[1..].chars().all(|c| c.is_ascii_digit()) {
+      return Some(name.to_string());
+    }
+    None
+  }
 
   fn text_color(&self) -> egui::Color32 {
     self.config.text_color.to_color32()
@@ -218,31 +422,21 @@ struct AppState {
 
   fn new(cc: &eframe::CreationContext<'_>) -> Self {
     let config_path = current_dir_config_path();
-    let config = read_config(&config_path);
+    let mut config = read_config(&config_path);
     let api_url =
       std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3005/ingest".to_string());
 
     let hotkey_manager = GlobalHotKeyManager::new().expect("global hotkeys must be available");
-    let show_hide = HotKey::new(Some(Modifiers::CONTROL), Code::KeyH);
-    let screenshot = HotKey::new(Some(Modifiers::CONTROL), Code::KeyQ);
-    let close_response = HotKey::new(Some(Modifiers::CONTROL), Code::KeyX);
-    hotkey_manager
-      .register(show_hide)
-      .expect("failed to register show/hide hotkey");
-    hotkey_manager
-      .register(screenshot)
-      .expect("failed to register screenshot hotkey");
-    hotkey_manager
-      .register(close_response)
-      .expect("failed to register close-response hotkey");
+    let hotkeys = Self::try_register_hotkeys_on_start(&mut config, &hotkey_manager);
 
     let (worker_tx, worker_rx) = mpsc::channel();
     let (hotkey_tx, hotkey_rx) = mpsc::channel();
 
     let main_visible_atomic = Arc::new(AtomicBool::new(true));
-    let show_hide_id = show_hide.id();
+    let show_hide_id = Arc::new(AtomicU32::new(hotkeys.show_hide.id()));
     let repaint_ctx = cc.egui_ctx.clone();
     let visible_flag = Arc::clone(&main_visible_atomic);
+    let show_hide_id_atomic = Arc::clone(&show_hide_id);
     #[cfg(target_os = "windows")]
     let response_title = Self::RESPONSE_TITLE.to_string();
 
@@ -268,7 +462,7 @@ struct AppState {
     std::thread::spawn(move || {
       let hotkey_events = GlobalHotKeyEvent::receiver();
       while let Ok(event) = hotkey_events.recv() {
-        if event.id == show_hide_id {
+        if event.id == show_hide_id_atomic.load(Ordering::SeqCst) {
           if event.state != HotKeyState::Pressed {
             continue;
           }
@@ -313,17 +507,18 @@ struct AppState {
     cc.egui_ctx.set_visuals(egui::Visuals::dark());
     install_phosphor_fonts(&cc.egui_ctx);
 
+    if write_config(&config_path, &config).is_ok() {
+      // Persist any fallback hotkey adjustments.
+    }
+
     Self {
       config: config.clone(),
       config_path,
       api_url,
-      hotkeys: HotKeys {
-        show_hide,
-        screenshot,
-        close_response,
-      },
+      hotkeys,
       _hotkey_manager: hotkey_manager,
       hotkey_rx,
+      show_hide_id,
       worker_tx,
       worker_rx,
       main_visible: true,
@@ -342,6 +537,10 @@ struct AppState {
       response_scroll_offset: 0.0,
       response_scroll_max: 0.0,
       main_fade: 0.0,
+      main_dragging: false,
+      hotkey_capture: None,
+      config_dirty: false,
+      last_config_save: std::time::Instant::now(),
       main_hwnd,
       main_hwnd_hooked: false,
       settings_hwnd_hooked: false,
@@ -357,6 +556,10 @@ struct AppState {
   }
 
   fn process_hotkeys(&mut self, ctx: &egui::Context) {
+    if self.hotkey_capture.is_some() {
+      while self.hotkey_rx.try_recv().is_ok() {}
+      return;
+    }
     while let Ok(event) = self.hotkey_rx.try_recv() {
       if event.id == self.hotkeys.show_hide.id() {
         if event.state != HotKeyState::Pressed {
@@ -374,7 +577,34 @@ struct AppState {
         self.start_capture(ctx);
       } else if event.id == self.hotkeys.close_response.id() {
         self.close_response();
+      } else if event.id == self.hotkeys.quit.id() {
+        if event.state == HotKeyState::Pressed {
+          self.quit_requested = true;
+        }
       }
+    }
+  }
+
+  fn process_hotkey_capture(&mut self, ctx: &egui::Context) {
+    let Some(action) = self.hotkey_capture else {
+      return;
+    };
+
+    let mut captured: Option<String> = None;
+    ctx.input(|i| {
+      for event in &i.events {
+        if let egui::Event::Key { key, pressed: true, .. } = event {
+          if let Some(token) = Self::egui_key_to_token(*key) {
+            captured = Some(token);
+            break;
+          }
+        }
+      }
+    });
+
+    if let Some(token) = captured {
+      self.update_hotkey_binding(action, token);
+      self.hotkey_capture = None;
     }
   }
 
@@ -454,6 +684,22 @@ struct AppState {
     let _ = write_config(&self.config_path, &self.config);
   }
 
+  fn schedule_config_save(&mut self) {
+    self.config_dirty = true;
+  }
+
+  fn flush_config_if_needed(&mut self) {
+    if !self.config_dirty {
+      return;
+    }
+    if self.last_config_save.elapsed().as_millis() < 150 {
+      return;
+    }
+    self.save_config();
+    self.config_dirty = false;
+    self.last_config_save = std::time::Instant::now();
+  }
+
   fn maybe_save_position(&mut self, ctx: &egui::Context) {
     let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
       return;
@@ -490,6 +736,7 @@ struct AppState {
       self.main_visible = desired;
       if !self.main_visible {
         self.settings_open = false;
+        self.hotkey_capture = None;
       }
       if self.main_visible {
         self.main_fade = 0.0;
@@ -647,18 +894,20 @@ struct AppState {
           let drag = ui.interact(
             ui.max_rect(),
             ui.id().with("drag"),
-            egui::Sense::click_and_drag(),
+            egui::Sense::drag(),
           );
           if drag.drag_started() {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
           }
+          self.main_dragging = drag.dragged();
           let row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
             let icon_size = 14.0;
             self.modifiers_row(ui, icon_size);
             Self::main_label(ui, self.main_text("+"));
             ui.add_space(-1.0);
-            self.text_badge(ui, "H", 3.0, 2.0, false);
+            let show_label = Self::hotkey_label_from_token(&self.config.hotkeys.show_hide);
+            self.text_badge(ui, &show_label, 3.0, 2.0, false);
             Self::main_label(ui, self.main_icon(phosphor::regular::EYE_SLASH, icon_size));
             ui.add_space(-1.0);
             Self::main_label(ui, self.main_text("Show/Hide"));
@@ -666,7 +915,8 @@ struct AppState {
             self.modifiers_row(ui, icon_size);
             Self::main_label(ui, self.main_text("+"));
             ui.add_space(-1.0);
-            self.text_badge(ui, "Q", 3.0, 2.0, false);
+            let shot_label = Self::hotkey_label_from_token(&self.config.hotkeys.screenshot);
+            self.text_badge(ui, &shot_label, 3.0, 2.0, false);
             Self::main_label(ui, self.main_icon(phosphor::regular::CAMERA, icon_size));
             Self::main_label(ui, self.main_text("Take screenshot"));
 
@@ -724,7 +974,9 @@ struct AppState {
         let total_height = main_row_size.y + margin.top + margin.bottom;
 
         let desired = egui::vec2(total_width + 2.0, total_height + 2.0);
-        self.update_main_size(ctx, desired);
+        if !self.main_dragging {
+          self.update_main_size(ctx, desired);
+        }
       });
   }
 
@@ -732,7 +984,13 @@ struct AppState {
 
 impl eframe::App for AppState {
   fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    if self.config.theme.eq_ignore_ascii_case("light") {
+      ctx.set_visuals(egui::Visuals::light());
+    } else {
+      ctx.set_visuals(egui::Visuals::dark());
+    }
     self.process_hotkeys(ctx);
+    self.process_hotkey_capture(ctx);
     self.process_worker_results();
     self.sync_visibility(ctx);
     if self.response_open {

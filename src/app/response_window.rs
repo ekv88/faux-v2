@@ -190,7 +190,8 @@ impl AppState {
               ui.horizontal(|ui| {
                 let icon_size = 14.0;
                 self.modifiers_row(ui, icon_size);
-                ui.label("+ X");
+                let close_label = Self::hotkey_label_from_token(&self.config.hotkeys.close_response);
+                ui.label(format!("+ {}", close_label));
                 ui.label("Close response");
               });
               ui.add_space(8.0);

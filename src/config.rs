@@ -18,6 +18,8 @@ pub struct AppConfig {
   pub divider_color: ColorConfig,
   pub response_max_width: f32,
   pub response_max_height: f32,
+  pub hotkeys: HotkeyConfig,
+  pub theme: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -32,6 +34,26 @@ pub struct ColorConfig {
   pub g: u8,
   pub b: u8,
   pub a: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyConfig {
+  pub show_hide: String,
+  pub screenshot: String,
+  pub close_response: String,
+  pub quit: String,
+}
+
+impl Default for HotkeyConfig {
+  fn default() -> Self {
+    Self {
+      show_hide: "H".to_string(),
+      screenshot: "Q".to_string(),
+      close_response: "X".to_string(),
+      quit: "P".to_string(),
+    }
+  }
 }
 
 impl ColorConfig {
@@ -135,6 +157,8 @@ impl Default for AppConfig {
       },
       response_max_width: 860.0,
       response_max_height: 620.0,
+      hotkeys: HotkeyConfig::default(),
+      theme: "dark".to_string(),
     }
   }
 }

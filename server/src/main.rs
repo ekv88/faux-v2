@@ -115,6 +115,8 @@ Focus on clear reasoning, concrete steps, and practical fixes."
 Analyze the screenshot and answer the question shown. \
 Identify the programming language from the prompt/code context and return the solution in that language. \
 Use the submit_solution tool call to return language, text (MDX), and code (no fences). \
+The language field MUST be a short file-extension for syntax highlighting (e.g., rs, py, ts, js, java) and MUST NOT be empty. \
+If you are unsure, infer from the screenshot context; as a last resort use \"text\". \
 The text field MUST be MDX (Markdown + fenced code blocks) and include language tags for all code snippets. \
 Ignore any irrelevant UI like tabs, taskbars, start menus, docks, or unrelated windows. \
 If the question is code-related, ALWAYS include a concrete code example. \
@@ -406,6 +408,24 @@ async fn call_openai(
       text: tool.text,
       code: tool.code,
     };
+    let mut lang = tool.language.trim().to_string();
+    if lang.is_empty() {
+      if let Some(found) = extract_fenced_language(&parsed.text) {
+        lang = found;
+      }
+    }
+    if lang.is_empty() {
+      lang = infer_language(&parsed.code, &parsed.text).to_string();
+    }
+    if lang.is_empty() {
+      lang = "text".to_string();
+    }
+    if !lang.is_empty() {
+      parsed.text = ensure_fenced_language(&parsed.text, &lang);
+      parsed.text = ensure_fenced_block(&parsed.text, &parsed.code, &lang);
+    } else {
+      parsed.text = ensure_fenced_block(&parsed.text, &parsed.code, "text");
+    }
     normalize_response(&mut parsed);
     return Ok((parsed, raw));
   }
@@ -457,6 +477,75 @@ fn extract_tool_call(api: &OpenAiResponse) -> Option<ToolResult> {
     }
   }
   None
+}
+
+fn ensure_fenced_language(text: &str, language: &str) -> String {
+  let mut out = String::with_capacity(text.len() + 16);
+  let mut first = true;
+  for line in text.lines() {
+    if !first {
+      out.push('\n');
+    }
+    first = false;
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+      let rest = trimmed.trim_start_matches("```").trim();
+      if rest.is_empty() {
+        let indent = &line[..line.len() - trimmed.len()];
+        out.push_str(indent);
+        out.push_str("```");
+        out.push_str(language);
+        continue;
+      }
+    }
+    out.push_str(line);
+  }
+  out
+}
+
+fn ensure_fenced_block(text: &str, code: &str, language: &str) -> String {
+  if code.trim().is_empty() {
+    return text.to_string();
+  }
+  if text.contains("```") {
+    return text.to_string();
+  }
+  let mut out = String::with_capacity(text.len() + code.len() + 16);
+  out.push_str(text);
+  if !text.ends_with('\n') {
+    out.push('\n');
+  }
+  out.push('\n');
+  out.push_str("```");
+  out.push_str(language);
+  out.push('\n');
+  out.push_str(code.trim_end());
+  out.push('\n');
+  out.push_str("```");
+  out
+}
+
+fn infer_language(code: &str, text: &str) -> &'static str {
+  let blob = format!("{text}\n{code}").to_lowercase();
+  if blob.contains("fn main") || blob.contains("use std::") || blob.contains("impl ") {
+    return "rs";
+  }
+  if blob.contains("def ") || blob.contains("import ") || blob.contains("print(") {
+    return "py";
+  }
+  if blob.contains("console.log") || blob.contains("function ") || blob.contains("=>") {
+    return "js";
+  }
+  if blob.contains("public static void main") || blob.contains("class ") && blob.contains("public ") {
+    return "java";
+  }
+  if blob.contains("using system") || blob.contains("namespace ") {
+    return "cs";
+  }
+  if blob.contains("package main") || blob.contains("func main") {
+    return "go";
+  }
+  ""
 }
 
 async fn insert_screen_result(
@@ -530,6 +619,22 @@ fn extract_fenced_code(text: &str) -> Option<String> {
   } else {
     Some(joined)
   }
+}
+
+fn extract_fenced_language(text: &str) -> Option<String> {
+  for line in text.lines() {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+      let rest = trimmed.trim_start_matches("```").trim();
+      if rest.is_empty() {
+        continue;
+      }
+      if let Some(lang) = rest.split_whitespace().next() {
+        return Some(lang.to_string());
+      }
+    }
+  }
+  None
 }
 
 async fn update_screen_result(

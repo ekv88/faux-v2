@@ -1,44 +1,21 @@
 # Faux V2 (Local Dev)
 
-## Prereqs
-- Rust toolchain
-- MySQL running locally
-
-## App (client)
-Run once:
+## Commands
 ```bash
+# App (client)
 cargo run
-```
-
-Watch + auto-rebuild:
-```bash
 cargo watch -c -w src -x run
-```
 
-## Server
-Run once:
-```bash
+# Build (client)
+cargo build -p faux_v2 --release
+
+# Server
 cargo run -p faux_server
-```
-
-Watch + auto-rebuild:
-```bash
 cargo watch -w server -x "run -p faux_server"
-```
 
-## Database (server)
-Migrate:
-```bash
+# Database (server)
 cargo run -p faux_server -- migrate
-```
-
-Seed:
-```bash
 cargo run -p faux_server -- seed
-```
-
-Reset (drop + recreate + migrate + seed):
-```bash
 cargo run -p faux_server -- reset
 ```
 

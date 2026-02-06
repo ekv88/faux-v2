@@ -10,6 +10,7 @@ use axum::{
   routing::{get, post},
   Json, Router,
 };
+use axum::response::sse::{Event, Sse};
 use base64::Engine as _;
 use sea_orm::{
   ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -17,8 +18,11 @@ use sea_orm::{
 };
 use sea_orm_migration::migrator::MigratorTrait;
 use serde::{Deserialize, Serialize};
+use futures_util::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 use std::time::Instant;
+use std::convert::Infallible;
 
 mod entity;
 
@@ -26,10 +30,40 @@ mod entity;
 struct AppState {
   client: reqwest::Client,
   openai_api_key: String,
-  openai_model: String,
+  default_model: ModelChoice,
   system_prompt: String,
   user_prompt: String,
+  stream_prompt: String,
   db: DatabaseConnection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelChoice {
+  Gpt52,
+  Gpt5Mini,
+  Gpt5Nano,
+  Gpt4oMini,
+}
+
+impl ModelChoice {
+  fn as_str(self) -> &'static str {
+    match self {
+      ModelChoice::Gpt52 => "gpt-5.2",
+      ModelChoice::Gpt5Mini => "gpt-5-mini",
+      ModelChoice::Gpt5Nano => "gpt-5-nano",
+      ModelChoice::Gpt4oMini => "gpt-4o-mini",
+    }
+  }
+
+  fn parse(value: &str) -> Option<Self> {
+    match value.trim().to_lowercase().as_str() {
+      "gpt-5.2" => Some(ModelChoice::Gpt52),
+      "gpt-5-mini" => Some(ModelChoice::Gpt5Mini),
+      "gpt-5-nano" => Some(ModelChoice::Gpt5Nano),
+      "gpt-4o-mini" => Some(ModelChoice::Gpt4oMini),
+      _ => None,
+    }
+  }
 }
 
 #[derive(Serialize)]
@@ -47,6 +81,14 @@ struct ErrorDetail {
 struct IngestResponse {
   text: String,
   code: String,
+}
+
+#[derive(Serialize)]
+struct StreamEnvelope {
+  #[serde(rename = "type")]
+  kind: String,
+  data: Option<String>,
+  error: Option<ErrorDetail>,
 }
 
 #[derive(Deserialize)]
@@ -102,7 +144,10 @@ async fn main() -> anyhow::Result<()> {
     }
   });
   let openai_api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-  let openai_model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string());
+  let default_model = env::var("OPENAI_MODEL")
+    .ok()
+    .and_then(|value| ModelChoice::parse(&value))
+    .unwrap_or(ModelChoice::Gpt5Mini);
   let system_prompt = env::var("OPENAI_SYSTEM_PROMPT").unwrap_or_else(|_| {
     "You are a senior software engineer and technical instructor. \
 You explain solutions like a professor: precise, methodical, and highly detailed, \
@@ -121,6 +166,16 @@ The text field MUST be MDX (Markdown + fenced code blocks) and include language 
 Ignore any irrelevant UI like tabs, taskbars, start menus, docks, or unrelated windows. \
 If the question is code-related, ALWAYS include a concrete code example. \
 Do not include any extra text outside the tool call."
+      .to_string()
+  });
+  let stream_prompt = env::var("OPENAI_STREAM_PROMPT").unwrap_or_else(|_| {
+    "You will receive an image (screenshot) of a technical test page or student-style question. \
+Analyze the screenshot and answer the question shown. \
+Respond in Markdown. If you include any code, ALWAYS put it inside fenced code blocks with language tags (e.g., ```rs). \
+Never output raw code without fences. \
+Start with a one-sentence summary before detailed steps. \
+Keep the response clear and step-by-step, and include a concrete code example when the question is code-related. \
+Ignore any irrelevant UI like tabs, taskbars, start menus, docks, or unrelated windows."
       .to_string()
   });
 
@@ -174,15 +229,17 @@ Do not include any extra text outside the tool call."
   let state = AppState {
     client: reqwest::Client::new(),
     openai_api_key,
-    openai_model,
+    default_model,
     system_prompt,
     user_prompt,
+    stream_prompt,
     db,
   };
 
   let app = Router::new()
     .route("/healthz", get(health))
     .route("/ingest", post(ingest))
+    .route("/ingest_stream", post(ingest_stream))
     .fallback(fallback_404)
     .layer(middleware::from_fn(method_not_allowed))
     .with_state(state)
@@ -278,6 +335,7 @@ async fn ingest(
 
   let user_id = require_user_id(&state.db, &headers).await?;
   let subscription_id = require_subscription(&state.db, &user_id).await?;
+  let model = select_model(&headers, &state);
 
   eprintln!(
     "Ingest start user_id={} bytes={} mime={}",
@@ -289,7 +347,7 @@ async fn ingest(
   let file_name = save_image(&image_bytes, &image_mime).map_err(internal_error("Save image failed"))?;
   let record_id = insert_screen_result(&state.db, Some(&user_id), &file_name).await;
 
-  match call_openai(&state, &image_bytes, &image_mime).await {
+  match call_openai(&state, &image_bytes, &image_mime, model.as_str()).await {
     Ok((response, raw_output)) => {
       let debug_json = serde_json::json!({
         "response": response.clone(),
@@ -333,16 +391,127 @@ async fn ingest(
   }
 }
 
+async fn ingest_stream(
+  State(state): State<AppState>,
+  headers: axum::http::HeaderMap,
+  mut multipart: Multipart,
+) -> Result<Sse<UnboundedReceiverStream<Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)>
+{
+  let mut image_bytes: Option<Vec<u8>> = None;
+  let mut image_mime = "image/png".to_string();
+
+  while let Some(field) = multipart
+    .next_field()
+    .await
+    .map_err(internal_error("Failed to read multipart"))?
+  {
+    if field.name() == Some("file") {
+      if let Some(content_type) = field.content_type() {
+        image_mime = content_type.to_string();
+      }
+      let data = field
+        .bytes()
+        .await
+        .map_err(internal_error("Failed to read upload bytes"))?;
+      image_bytes = Some(data.to_vec());
+      break;
+    }
+  }
+
+  let image_bytes =
+    image_bytes.ok_or_else(|| bad_request("Missing `file` field in multipart"))?;
+
+  let user_id = require_user_id(&state.db, &headers).await?;
+  let subscription_id = require_subscription(&state.db, &user_id).await?;
+  let model = select_model(&headers, &state);
+
+  let file_name = save_image(&image_bytes, &image_mime).map_err(internal_error("Save image failed"))?;
+  let record_id = insert_screen_result(&state.db, Some(&user_id), &file_name).await;
+
+  let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+  let state_clone = state.clone();
+
+  tokio::spawn(async move {
+    let mut full_text = String::new();
+    let stream_result = call_openai_stream(
+      &state_clone,
+      &image_bytes,
+      &image_mime,
+      model.as_str(),
+      |delta| {
+      full_text.push_str(delta);
+      let payload = StreamEnvelope {
+        kind: "delta".to_string(),
+        data: Some(delta.to_string()),
+        error: None,
+      };
+      let _ =
+        tx.send(Ok(Event::default().data(serde_json::to_string(&payload).unwrap_or_default())));
+    })
+    .await;
+
+    match stream_result {
+      Ok(()) => {
+        let final_text = sanitize_stream_text(&full_text);
+        let response = IngestResponse {
+          text: final_text.clone(),
+          code: String::new(),
+        };
+        let debug_json = serde_json::json!({
+          "text": final_text
+        });
+        let _ = decrement_subscription(&state_clone.db, subscription_id).await;
+        update_screen_result(
+          &state_clone.db,
+          &record_id,
+          "DONE",
+          &debug_json,
+        )
+        .await;
+        let payload = StreamEnvelope {
+          kind: "done".to_string(),
+          data: Some(response.text.clone()),
+          error: None,
+        };
+        let _ = tx.send(Ok(Event::default().data(serde_json::to_string(&payload).unwrap_or_default())));
+      }
+      Err((status, body)) => {
+        let debug_json = serde_json::json!({
+          "status": status.as_u16(),
+          "error": body.error.clone()
+        });
+        update_screen_result(
+          &state_clone.db,
+          &record_id,
+          "ERROR",
+          &debug_json,
+        )
+        .await;
+        let payload = StreamEnvelope {
+          kind: "error".to_string(),
+          data: None,
+          error: Some(body.error.clone()),
+        };
+        let _ = tx.send(Ok(Event::default().data(serde_json::to_string(&payload).unwrap_or_default())));
+      }
+    }
+  });
+
+  let stream = UnboundedReceiverStream::new(rx);
+  Ok(Sse::new(stream))
+}
+
 async fn call_openai(
   state: &AppState,
   image_bytes: &[u8],
   image_mime: &str,
+  model: &str,
 ) -> Result<(IngestResponse, String), (StatusCode, Json<ErrorResponse>)> {
   let encoded = base64::engine::general_purpose::STANDARD.encode(image_bytes);
   let image_url = format!("data:{image_mime};base64,{encoded}");
 
   let body = serde_json::json!({
-    "model": state.openai_model,
+    "model": model,
     "input": [
       {
         "role": "system",
@@ -442,6 +611,94 @@ async fn call_openai(
 
   normalize_response(&mut parsed);
   Ok((parsed, output_text))
+}
+
+async fn call_openai_stream<F>(
+  state: &AppState,
+  image_bytes: &[u8],
+  image_mime: &str,
+  model: &str,
+  mut on_delta: F,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)>
+where
+  F: FnMut(&str),
+{
+  let encoded = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+  let image_url = format!("data:{image_mime};base64,{encoded}");
+
+  let body = serde_json::json!({
+    "model": model,
+    "stream": true,
+    "input": [
+      {
+        "role": "system",
+        "content": [
+          { "type": "input_text", "text": state.system_prompt }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          { "type": "input_text", "text": state.stream_prompt },
+          { "type": "input_image", "image_url": image_url }
+        ]
+      }
+    ]
+  });
+
+  let response = state
+    .client
+    .post("https://api.openai.com/v1/responses")
+    .bearer_auth(&state.openai_api_key)
+    .json(&body)
+    .send()
+    .await
+    .map_err(internal_error("OpenAI request failed"))?;
+
+  if !response.status().is_success() {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    return Err(error_response(
+      StatusCode::BAD_GATEWAY,
+      &format!("OpenAI error: {status} {body}"),
+      None,
+    ));
+  }
+
+  let mut buffer = String::new();
+  let mut stream = response.bytes_stream();
+  while let Some(chunk) = stream.next().await {
+    let chunk = match chunk {
+      Ok(bytes) => bytes,
+      Err(err) => return Err(internal_error("OpenAI stream failed")(err)),
+    };
+    buffer.push_str(&String::from_utf8_lossy(&chunk));
+    while let Some(pos) = buffer.find('\n') {
+      let line = buffer[..pos].trim_end().to_string();
+      buffer = buffer[pos + 1..].to_string();
+      if line.is_empty() {
+        continue;
+      }
+      let Some(data) = line.strip_prefix("data:") else {
+        continue;
+      };
+      let payload = data.trim();
+      if payload.is_empty() || payload == "[DONE]" {
+        continue;
+      }
+      if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+        if value.get("type").and_then(|v| v.as_str()) == Some("response.output_text.delta") {
+          if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+            if !delta.is_empty() {
+              on_delta(delta);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  Ok(())
 }
 
 fn extract_output_text(api: &OpenAiResponse) -> Option<String> {
@@ -546,6 +803,90 @@ fn infer_language(code: &str, text: &str) -> &'static str {
     return "go";
   }
   ""
+}
+
+fn sanitize_stream_text(text: &str) -> String {
+  if text.trim().is_empty() {
+    return text.to_string();
+  }
+  if text.contains("```") {
+    let mut lang =
+      extract_fenced_language(text).unwrap_or_else(|| infer_language("", text).to_string());
+    if lang.is_empty() {
+      lang = "text".to_string();
+    }
+    return ensure_fenced_language(text, &lang);
+  }
+
+  if looks_like_code(text) {
+    let mut lang = infer_language("", text).to_string();
+    if lang.is_empty() {
+      lang = "text".to_string();
+    }
+    return wrap_code_block(text, &lang);
+  }
+
+  text.to_string()
+}
+
+fn looks_like_code(text: &str) -> bool {
+  let mut non_empty = 0;
+  let mut codeish = 0;
+  for line in text.lines() {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    non_empty += 1;
+    let lower = trimmed.to_lowercase();
+    if line.starts_with("  ")
+      || line.starts_with('\t')
+      || trimmed.ends_with(';')
+      || trimmed.ends_with('{')
+      || trimmed.ends_with('}')
+      || trimmed.contains("=>")
+      || trimmed.contains("::")
+      || trimmed.contains("();")
+      || lower.starts_with("fn ")
+      || lower.starts_with("def ")
+      || lower.starts_with("class ")
+      || lower.starts_with("public ")
+      || lower.starts_with("private ")
+      || lower.starts_with("let ")
+      || lower.starts_with("const ")
+      || lower.starts_with("var ")
+      || lower.starts_with("import ")
+      || lower.starts_with("using ")
+      || lower.starts_with("#include")
+    {
+      codeish += 1;
+    }
+  }
+  non_empty >= 3 && codeish * 2 >= non_empty
+}
+
+fn wrap_code_block(text: &str, language: &str) -> String {
+  let mut out = String::new();
+  out.push_str("```");
+  out.push_str(language);
+  out.push('\n');
+  out.push_str(text.trim_end());
+  out.push('\n');
+  out.push_str("```");
+  out
+}
+
+fn select_model(headers: &axum::http::HeaderMap, state: &AppState) -> ModelChoice {
+  let header = headers
+    .get("x-model")
+    .and_then(|val| val.to_str().ok())
+    .unwrap_or("")
+    .trim()
+    .to_string();
+  if header.is_empty() {
+    return state.default_model;
+  }
+  ModelChoice::parse(&header).unwrap_or(state.default_model)
 }
 
 async fn insert_screen_result(

@@ -20,6 +20,7 @@ pub struct AppConfig {
   pub response_max_height: f32,
   pub hotkeys: HotkeyConfig,
   pub theme: String,
+  pub model: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -159,6 +160,7 @@ impl Default for AppConfig {
       response_max_height: 620.0,
       hotkeys: HotkeyConfig::default(),
       theme: "dark".to_string(),
+      model: "gpt-5-mini".to_string(),
     }
   }
 }

@@ -21,6 +21,7 @@ mod settings_window;
 pub fn run() -> eframe::Result<()> {
   dotenvy::dotenv().ok();
   let config = read_config(&current_dir_config_path());
+  let icon = load_app_icon();
 
     let mut viewport = egui::ViewportBuilder::default()
       .with_title("Faux")
@@ -29,6 +30,9 @@ pub fn run() -> eframe::Result<()> {
       .with_decorations(false)
       .with_transparent(true)
       .with_taskbar(false);
+    if let Some(icon) = icon {
+      viewport = viewport.with_icon(icon);
+    }
     if config.always_on_top {
       viewport = viewport.with_always_on_top();
     }
@@ -43,6 +47,12 @@ pub fn run() -> eframe::Result<()> {
   };
 
   eframe::run_native("Faux", options, Box::new(|cc| Box::new(AppState::new(cc))))
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+  let path = std::path::Path::new("assets").join("icon.png");
+  let bytes = std::fs::read(path).ok()?;
+  eframe::icon_data::from_png_bytes(&bytes).ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,12 +115,15 @@ struct AppState {
     background_picker_open: bool,
     text_picker_open: bool,
     divider_picker_open: bool,
+    next_request_id: u64,
+    current_request_id: Option<u64>,
   }
 
   impl AppState {
-    const MAIN_LETTER_SPACING: f32 = -0.5;
+  const MAIN_LETTER_SPACING: f32 = -0.5;
   const RESPONSE_MIN_WIDTH: f32 = 470.0;
   const RESPONSE_MAX_WIDTH: f32 = 860.0;
+  const RESPONSE_MIN_HEIGHT: f32 = 180.0;
   const RESPONSE_HEIGHT: f32 = 400.0;
   const RESPONSE_ANCHOR_GAP: f32 = 10.0;
     const RESPONSE_TITLE: &'static str = "Faux Response";
@@ -212,6 +225,13 @@ struct AppState {
 
   fn apply_hotkeys_from_config(&mut self) {
     let desired_hotkeys = Self::hotkeys_from_config(&self.config);
+    eprintln!(
+      "Apply hotkeys: show_hide={} screenshot={} close={} quit={}",
+      self.config.hotkeys.show_hide,
+      self.config.hotkeys.screenshot,
+      self.config.hotkeys.close_response,
+      self.config.hotkeys.quit
+    );
     if desired_hotkeys == self.hotkeys {
       return;
     }
@@ -423,8 +443,8 @@ struct AppState {
   fn new(cc: &eframe::CreationContext<'_>) -> Self {
     let config_path = current_dir_config_path();
     let mut config = read_config(&config_path);
-    let api_url =
-      std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3005/ingest".to_string());
+    let api_url = std::env::var("API_URL")
+      .unwrap_or_else(|_| "http://localhost:3005/ingest_stream".to_string());
 
     let hotkey_manager = GlobalHotKeyManager::new().expect("global hotkeys must be available");
     let hotkeys = Self::try_register_hotkeys_on_start(&mut config, &hotkey_manager);
@@ -552,6 +572,8 @@ struct AppState {
         background_picker_open: false,
         text_picker_open: false,
         divider_picker_open: false,
+        next_request_id: 1,
+        current_request_id: None,
       }
   }
 
@@ -611,15 +633,37 @@ struct AppState {
   fn process_worker_results(&mut self) {
     while let Ok(result) = self.worker_rx.try_recv() {
       match result {
-        WorkerResult::Uploading => {
+        WorkerResult::Uploading(id) => {
+          if Some(id) != self.current_request_id {
+            continue;
+          }
           self.response_status = Some("Uploading...".to_string());
           self.loading = true;
         }
-          WorkerResult::Ok(mut response) => {
-            let trimmed = response.code.trim();
-            if trimmed.eq_ignore_ascii_case("rs")
-              || trimmed.eq_ignore_ascii_case("rust")
-              || trimmed.eq_ignore_ascii_case("code")
+        WorkerResult::StreamDelta(id, delta) => {
+          if Some(id) != self.current_request_id {
+            continue;
+          }
+          if self.response.is_none() {
+            self.response = Some(ApiResponse {
+              text: String::new(),
+              code: String::new(),
+            });
+          }
+          if let Some(response) = &mut self.response {
+            response.text.push_str(&delta);
+          }
+          self.loading = true;
+          self.response_status = Some("Generating...".to_string());
+        }
+        WorkerResult::Ok(id, mut response) => {
+          if Some(id) != self.current_request_id {
+            continue;
+          }
+          let trimmed = response.code.trim();
+          if trimmed.eq_ignore_ascii_case("rs")
+            || trimmed.eq_ignore_ascii_case("rust")
+            || trimmed.eq_ignore_ascii_case("code")
             {
               response.code.clear();
             }
@@ -628,7 +672,10 @@ struct AppState {
             self.last_error = None;
             self.response_status = Some("Ready".to_string());
           }
-        WorkerResult::Err(err) => {
+        WorkerResult::Err(id, err) => {
+          if Some(id) != self.current_request_id {
+            continue;
+          }
           self.loading = false;
           self.response = None;
           self.last_error = Some(err);
@@ -644,12 +691,16 @@ struct AppState {
     }
     self.update_last_screen_point(ctx);
     self.loading = true;
+    let request_id = self.next_request_id;
+    self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+    self.current_request_id = Some(request_id);
     self.response_open = true;
     self.response_hwnd_hooked = false;
     self.response_last_pos = None;
     self.response = None;
     self.last_error = None;
     self.response_status = Some("Capturing...".to_string());
+    self.response_size.y = Self::RESPONSE_MIN_HEIGHT;
     self.response_scroll_offset = 0.0;
     self.response_scroll_max = 0.0;
     self.response_scroll_offset = 0.0;
@@ -660,11 +711,13 @@ struct AppState {
       .api_key
       .trim()
       .to_string();
+    let model = self.config.model.trim().to_string();
     let tx = self.worker_tx.clone();
     let capture_point = self.last_screen_point;
     std::thread::spawn(move || {
       let token = if auth_token.is_empty() { None } else { Some(auth_token) };
-      capture_and_upload(&api_url, &tx, capture_point, token);
+      let model = if model.is_empty() { None } else { Some(model) };
+      capture_and_upload(&api_url, &tx, capture_point, token, model, request_id);
     });
   }
 
@@ -678,6 +731,7 @@ struct AppState {
     self.response_status = None;
     self.response_scroll_offset = 0.0;
     self.response_scroll_max = 0.0;
+    self.current_request_id = None;
   }
 
   fn save_config(&self) {
@@ -1020,7 +1074,11 @@ impl eframe::App for AppState {
       return;
     }
 
-    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    if self.loading || self.main_fade < 1.0 {
+      ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    } else if self.response_open {
+      ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
   }
 
   fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

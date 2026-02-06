@@ -6,6 +6,39 @@ use crate::ui::show_skeleton;
 use super::AppState;
 
 impl AppState {
+  fn should_fast_markdown(text: &str) -> bool {
+    let len = text.len();
+    if len > 12000 {
+      return true;
+    }
+    let mut lines = 0usize;
+    for _ in text.lines() {
+      lines += 1;
+      if lines > 400 {
+        return true;
+      }
+    }
+    false
+  }
+
+  fn strip_fence_languages(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+      let trimmed = line.trim_start();
+      if trimmed.starts_with("```") {
+        let indent_len = line.len() - trimmed.len();
+        if indent_len > 0 {
+          out.push_str(&line[..indent_len]);
+        }
+        out.push_str("```");
+      } else {
+        out.push_str(line);
+      }
+      out.push('\n');
+    }
+    out
+  }
+
   fn measure_max_line_width(
     ctx: &egui::Context,
     text: &str,
@@ -97,7 +130,8 @@ impl AppState {
       self.response_size.x = desired_width;
       width_changed = true;
     }
-    let max_height = self.config.response_max_height.max(120.0);
+    let min_height = Self::RESPONSE_MIN_HEIGHT;
+    let max_height = self.config.response_max_height.max(min_height);
     let mut height_changed = false;
     if self.response.is_some() && !self.loading && self.last_error.is_none() {
       if (self.response_size.y - max_height).abs() > 1.0 {
@@ -105,8 +139,8 @@ impl AppState {
         height_changed = true;
       }
     }
-    if self.response_size.y > max_height {
-      self.response_size.y = max_height;
+    if self.response_size.y > max_height || self.response_size.y < min_height {
+      self.response_size.y = self.response_size.y.clamp(min_height, max_height);
       height_changed = true;
     }
 
@@ -161,22 +195,23 @@ impl AppState {
         #[cfg(target_os = "windows")]
         self.apply_windows_response_transparency();
 
-        let panel_frame = egui::Frame::none()
-          .fill(egui::Color32::TRANSPARENT)
-          .stroke(egui::Stroke::NONE);
-
         let fill = if cfg!(target_os = "windows") {
           self.background_color_layered()
         } else {
           self.background_color()
         };
-        let frame = egui::Frame::none()
+        let panel_frame = egui::Frame::none()
           .fill(fill)
           .stroke(egui::Stroke::new(1.0, self.border_color()))
-          .rounding(egui::Rounding::same(5.0))
+          .rounding(egui::Rounding::same(5.0));
+        let frame = egui::Frame::none()
+          .fill(egui::Color32::TRANSPARENT)
+          .stroke(egui::Stroke::NONE)
           .inner_margin(egui::Margin::symmetric(14.0, 12.0));
 
-        let mut content_size = None;
+        let mut frame_rect = None;
+        let mut scroll_view_height = None;
+        let mut scroll_content_height = None;
         egui::CentralPanel::default()
           .frame(panel_frame)
           .show(ctx, |ui| {
@@ -198,7 +233,7 @@ impl AppState {
               ui.separator();
               ui.add_space(8.0);
 
-              if self.loading {
+              if self.loading && self.response.is_none() {
                 show_skeleton(ui, self.skeleton_color());
                 return;
               }
@@ -244,6 +279,11 @@ impl AppState {
 
               if let Some(response) = &self.response {
                 let response_text = response.text.clone();
+                let render_text = if Self::should_fast_markdown(&response_text) {
+                  Self::strip_fence_languages(&response_text)
+                } else {
+                  response_text.clone()
+                };
                 let text_color = self.text_color();
                 let output = egui::ScrollArea::vertical()
                   .id_source("response_scroll")
@@ -256,7 +296,7 @@ impl AppState {
                       let viewer = CommonMarkViewer::new("response_markdown")
                         .syntax_theme_dark("base16-ocean.dark")
                         .syntax_theme_light("base16-ocean.light");
-                      viewer.show(ui, &mut self.markdown_cache, &response_text);
+                      viewer.show(ui, &mut self.markdown_cache, &render_text);
                     });
                   });
                 let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
@@ -264,16 +304,24 @@ impl AppState {
                   self.response_scroll_offset = max_offset;
                 }
                 self.response_scroll_max = max_offset;
+                scroll_view_height = Some(output.inner_rect.height());
+                scroll_content_height = Some(output.content_size.y);
               }
             });
-            let frame_rect = response.response.rect;
-            self.show_response_status_overlay(ctx, frame_rect);
-            content_size = Some(frame_rect.size());
+            frame_rect = Some(response.response.rect);
+            self.show_response_status_overlay(ctx, response.response.rect);
           });
 
-        if let Some(size) = content_size {
-          let max_height = self.config.response_max_height.max(120.0);
-          let desired_height = size.y.clamp(120.0, max_height).ceil();
+        if let (Some(frame_rect), Some(view_h), Some(content_h)) = (
+          frame_rect,
+          scroll_view_height,
+          scroll_content_height,
+        ) {
+          let max_height = self.config.response_max_height.max(min_height);
+          let chrome_height = (frame_rect.height() - view_h).max(0.0);
+          let desired_height = (chrome_height + content_h)
+            .clamp(min_height, max_height)
+            .ceil();
           if (self.response_size.y - desired_height).abs() > 1.0 {
             self.response_size.y = desired_height;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(

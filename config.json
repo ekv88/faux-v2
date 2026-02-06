@@ -1,23 +1,24 @@
 {
   "test": true,
   "main_position": {
-    "x": 207.0,
-    "y": 412.0
+    "x": 1212.0,
+    "y": 379.0
   },
   "api_key": "jwt-0f2d5b6a-7f8a-4b2e-9b43-0a5a2a9f9b01",
-  "opacity": 0.72,
+  "opacity": 0.9,
   "stealth": false,
   "always_on_top": true,
   "background": "41, 41, 41, 255",
   "text_color": "156, 145, 145, 255",
   "divider_color": "68, 67, 67, 152",
-  "response_max_width": 1130.0,
-  "response_max_height": 910.0,
+  "response_max_width": 750.0,
+  "response_max_height": 650.0,
   "hotkeys": {
     "show_hide": "H",
     "screenshot": "Q",
     "close_response": "X",
     "quit": "P"
   },
-  "theme": "dark"
+  "theme": "dark",
+  "model": "gpt-5.2"
 }

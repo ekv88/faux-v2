@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::BufRead;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,9 +25,10 @@ struct ErrorDetail {
 }
 
 pub enum WorkerResult {
-  Uploading,
-  Ok(ApiResponse),
-  Err(String),
+  Uploading(u64),
+  StreamDelta(u64, String),
+  Ok(u64, ApiResponse),
+  Err(u64, String),
 }
 
 pub fn capture_and_upload(
@@ -34,13 +36,22 @@ pub fn capture_and_upload(
   tx: &mpsc::Sender<WorkerResult>,
   screen_point: Option<(i32, i32)>,
   auth_token: Option<String>,
+  model: Option<String>,
+  request_id: u64,
 ) {
-  match capture_and_upload_inner(api_url, tx, screen_point, auth_token.as_deref()) {
+  match capture_and_upload_inner(
+    api_url,
+    tx,
+    screen_point,
+    auth_token.as_deref(),
+    model.as_deref(),
+    request_id,
+  ) {
     Ok(response) => {
-      let _ = tx.send(WorkerResult::Ok(response));
+      let _ = tx.send(WorkerResult::Ok(request_id, response));
     }
     Err(err) => {
-      let _ = tx.send(WorkerResult::Err(err));
+      let _ = tx.send(WorkerResult::Err(request_id, err));
     }
   }
 }
@@ -50,6 +61,8 @@ fn capture_and_upload_inner(
   tx: &mpsc::Sender<WorkerResult>,
   screen_point: Option<(i32, i32)>,
   auth_token: Option<&str>,
+  model: Option<&str>,
+  request_id: u64,
 ) -> Result<ApiResponse, String> {
   let screen = if let Some((x, y)) = screen_point {
     if let Ok(screen) = screenshots::Screen::from_point(x, y) {
@@ -69,7 +82,7 @@ fn capture_and_upload_inner(
       .ok_or_else(|| "No screens found".to_string())?
   };
   let image = screen.capture().map_err(|e| e.to_string())?;
-  let _ = tx.send(WorkerResult::Uploading);
+  let _ = tx.send(WorkerResult::Uploading(request_id));
 
   let timestamp = SystemTime::now()
     .duration_since(UNIX_EPOCH)
@@ -106,6 +119,12 @@ fn capture_and_upload_inner(
       eprintln!("Auth token present but empty after trim.");
     }
   }
+  if let Some(model) = model {
+    let model = model.trim();
+    if !model.is_empty() {
+      request = request.header("x-model", model);
+    }
+  }
   let request = request.build().map_err(|e| map_request_error(api_url, e))?;
   if cfg!(debug_assertions) {
     log_request_details(&request, byte_len);
@@ -117,6 +136,17 @@ fn capture_and_upload_inner(
   if cfg!(debug_assertions) {
     log_response_details(status, response.headers());
   }
+  let is_stream = response
+    .headers()
+    .get(reqwest::header::CONTENT_TYPE)
+    .and_then(|val| val.to_str().ok())
+    .map(|ct| ct.contains("text/event-stream"))
+    .unwrap_or(false);
+
+  if is_stream {
+    return read_streaming_response(response, tx, request_id);
+  }
+
   let body_bytes = response
     .bytes()
     .map_err(|e| map_request_error(api_url, e))?;
@@ -144,6 +174,79 @@ fn capture_and_upload_inner(
       eprintln!("API response parse error: {err}. Body: {body_text}");
     }
     "Server returned an invalid response. Please try again or check server logs.".to_string()
+  })
+}
+
+#[derive(Deserialize)]
+struct StreamEnvelope {
+  #[serde(rename = "type")]
+  kind: String,
+  data: Option<String>,
+  error: Option<ErrorDetail>,
+}
+
+fn read_streaming_response(
+  response: reqwest::blocking::Response,
+  tx: &mpsc::Sender<WorkerResult>,
+  request_id: u64,
+) -> Result<ApiResponse, String> {
+  let mut reader = std::io::BufReader::new(response);
+  let mut full_text = String::new();
+
+  loop {
+    let mut line = String::new();
+    let bytes = reader
+      .read_line(&mut line)
+      .map_err(|e| format!("Failed to read stream: {e}"))?;
+    if bytes == 0 {
+      break;
+    }
+    let line = line.trim_end();
+    if line.is_empty() {
+      continue;
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+      continue;
+    };
+    let payload = data.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+      continue;
+    }
+    if let Ok(event) = serde_json::from_str::<StreamEnvelope>(payload) {
+      match event.kind.as_str() {
+        "delta" => {
+          if let Some(delta) = event.data {
+            if !delta.is_empty() {
+              full_text.push_str(&delta);
+              let _ = tx.send(WorkerResult::StreamDelta(request_id, delta));
+            }
+          }
+        }
+        "done" => {
+          if let Some(text) = event.data {
+            if !text.is_empty() {
+              full_text = text;
+            }
+          }
+          return Ok(ApiResponse {
+            text: full_text,
+            code: String::new(),
+          });
+        }
+        "error" => {
+          if let Some(err) = event.error {
+            return Err(format!("Error ({}): {}", err.code, err.message));
+          }
+          return Err("Server returned an error.".to_string());
+        }
+        _ => {}
+      }
+    }
+  }
+
+  Ok(ApiResponse {
+    text: full_text,
+    code: String::new(),
   })
 }
 

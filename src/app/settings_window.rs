@@ -12,7 +12,7 @@ impl AppState {
 
     let viewport = egui::ViewportBuilder::default()
       .with_title("Settings")
-      .with_inner_size([315.0, 430.0])
+      .with_inner_size([315.0, 475.0])
       .with_resizable(false)
       .with_transparent(true)
       .with_taskbar(false);
@@ -88,6 +88,22 @@ impl AppState {
                 .desired_width((ui.available_width() - 5.0).max(0.0)),
             );
             changed |= response.changed();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Model").strong());
+            let mut model = self.config.model.clone();
+            egui::ComboBox::from_id_source("model_select")
+              .selected_text(model.clone())
+              .width((ui.available_width() - 5.0).max(0.0))
+              .show_ui(ui, |ui| {
+                ui.selectable_value(&mut model, "gpt-5.2".to_string(), "gpt-5.2 (best)");
+                ui.selectable_value(&mut model, "gpt-5-mini".to_string(), "gpt-5-mini");
+                ui.selectable_value(&mut model, "gpt-5-nano".to_string(), "gpt-5-nano (fast)");
+                ui.selectable_value(&mut model, "gpt-4o-mini".to_string(), "gpt-4o-mini (fastest)");
+              });
+            if model != self.config.model {
+              self.config.model = model;
+              changed = true;
+            }
           });
 
           ui.add_space(10.0);
@@ -318,7 +334,7 @@ impl AppState {
           });
 
           ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(5.0);
+            ui.add_space(7.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
               ui.add_space(0.0);
               let close_text = egui::RichText::new("Close").size(14.3);
